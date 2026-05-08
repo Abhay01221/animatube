@@ -1,0 +1,107 @@
+// Prisma schema for Animatube (Prisma 7)
+// Connection URL is configured in prisma.config.ts
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── NextAuth required tables ────────────────────────────────────────────────
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ─── App models ──────────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  googleId      String?   @unique
+
+  // AES-256 encrypted YouTube OAuth tokens (JSON blob)
+  youtubeTokens String? @db.Text
+
+  // User preferences stored as JSON
+  settings Json?
+
+  accounts Account[]
+  sessions Session[]
+  videos   Video[]
+
+  createdAt DateTime @default(now())
+}
+
+model Video {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  jobId  String @unique
+  status String // pending | processing | completed | failed
+
+  prompt     String @db.Text
+  style      String
+  duration   String
+  voice      String
+  language   String
+  visibility String @default("private")
+
+  // Populated after script generation
+  scriptJson  Json?
+  title       String?
+  description String? @db.Text
+  tags        String[]
+
+  // S3 keys
+  s3VoiceUrl    String?
+  s3VideoUrl    String? // final_video.mp4
+  s3RawVideoUrl String? // raw_video.mp4 (before subtitles)
+
+  // YouTube
+  youtubeId    String?
+  youtubeUrl   String?
+  thumbnailUrl String?
+
+  errorMessage String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
