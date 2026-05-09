@@ -13,7 +13,7 @@ import { Redis } from "@upstash/redis";
 
 // ─── Input validation schema ──────────────────────────────────────────────────
 const GenerateSchema = z.object({
-  prompt: z.string().min(10, "Prompt must be at least 10 characters").max(500),
+  prompt: z.string().min(10, "Prompt must be at least 10 characters").max(20000),
   style: z.enum(["educational", "storytelling", "motivational", "documentary", "anime-style"]),
   duration: z.enum(["short", "long"]),
   voice: z.enum(["male", "female", "ai_narrator"]),

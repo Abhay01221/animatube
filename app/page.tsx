@@ -174,12 +174,12 @@ export default function HomePage() {
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               placeholder="e.g. Explain how neural networks work in simple terms, with real-world examples..."
-              className="min-h-[120px] bg-[#080808] border-[#1f1f1f] text-zinc-100 placeholder:text-zinc-600 focus:border-violet-500 focus:ring-violet-500/20 resize-none text-base"
-              maxLength={500}
+              className="min-h-[160px] bg-[#080808] border-[#1f1f1f] text-zinc-100 placeholder:text-zinc-600 focus:border-violet-500 focus:ring-violet-500/20 resize-y text-base"
+              maxLength={20000}
             />
             <div className="flex justify-end mt-1">
               <span className="text-xs text-zinc-600">
-                {prompt.length}/500
+                {prompt.length}/20000
               </span>
             </div>
           </div>
