@@ -40,11 +40,14 @@ export async function GET(
     id: video.id,
     jobId,
     status: video.status,
+    renderStatus: video.renderStatus,
+    uploadStatus: video.uploadStatus,
     title: video.title,
     youtubeUrl: video.youtubeUrl,
     youtubeId: video.youtubeId,
     s3VideoUrl: video.s3VideoUrl,
-    errorMessage: video.errorMessage,
+    renderError: video.renderError,
+    uploadError: video.uploadError,
     stages,
   });
 }

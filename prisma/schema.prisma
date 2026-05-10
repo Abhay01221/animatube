@@ -75,7 +75,14 @@ model Video {
   user   User   @relation(fields: [userId], references: [id])
 
   jobId  String @unique
-  status String // pending | processing | completed | failed
+  
+  // Legacy status field (kept for backward compatibility)
+  status String @default("pending") // pending | processing | completed | failed
+
+  // New granular status fields
+  renderStatus String @default("pending") // pending | processing | completed | failed
+  uploadStatus String @default("not_started") // not_started | queued | uploading | uploaded | failed
+  subtitlesAdded Boolean @default(false)
 
   prompt     String @db.Text
   style      String
@@ -90,17 +97,28 @@ model Video {
   description String? @db.Text
   tags        String[]
 
-  // S3 keys
+  // Cinematic enhancements
+  storyPlan   Json? // StoryPlan structure
+  scenes      Json? // CinematicScene[] array
+  characters  Json? // CharacterDescription[] array
+  storyboard  Json? // Storyboard preview data
+
+  // Local file storage
+  localFilePath String? // Path to final MP4 in local library
+
+  // S3 keys (optional cloud storage)
   s3VoiceUrl    String?
   s3VideoUrl    String? // final_video.mp4
   s3RawVideoUrl String? // raw_video.mp4 (before subtitles)
 
-  // YouTube
+  // YouTube upload (completely optional)
   youtubeId    String?
   youtubeUrl   String?
   thumbnailUrl String?
 
-  errorMessage String? @db.Text
+  // Error tracking (separate for render vs upload)
+  renderError String? @db.Text
+  uploadError String? @db.Text
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

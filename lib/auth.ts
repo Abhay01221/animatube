@@ -7,7 +7,7 @@ import NextAuth from "next-auth";
 import Google from "next-auth/providers/google";
 import { PrismaAdapter } from "@auth/prisma-adapter";
 import { prisma } from "./prisma";
-import { encrypt } from "./encrypt";
+import { encrypt, decrypt } from "./encrypt";
 
 const authConfig = {
   adapter: PrismaAdapter(prisma),
@@ -35,14 +35,14 @@ const authConfig = {
     }),
   ],
   callbacks: {
-    async session({ session, user }) {
+    async session({ session, user }: any) {
       console.log("[auth] session callback - user:", user?.id, "email:", user?.email);
       // Attach user ID to session for API routes
       session.user.id = user.id;
       console.log("[auth] session callback - returning session with user.id:", session.user.id);
       return session;
     },
-    async signIn({ user, account, profile }) {
+    async signIn({ user, account, profile }: any) {
       console.log("[auth] signIn callback triggered");
       console.log("[auth] - provider:", account?.provider);
       console.log("[auth] - user.id:", user?.id);
@@ -127,7 +127,7 @@ const authConfig = {
     signIn: "/",
   },
   session: { 
-    strategy: "database",
+    strategy: "database" as const,
     maxAge: 30 * 24 * 60 * 60, // 30 days
   },
   cookies: {
@@ -135,13 +135,13 @@ const authConfig = {
       name: `next-auth.session-token`,
       options: {
         httpOnly: true,
-        sameSite: 'lax',
+        sameSite: 'lax' as const,
         path: '/',
         secure: false, // Set to false for localhost
       },
     },
   },
-} as const;
+};
 
 // Log the config on startup (excluding sensitive data)
 console.log("[auth] NextAuth Configuration:");

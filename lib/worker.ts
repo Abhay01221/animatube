@@ -12,11 +12,11 @@ import * as path from "path";
 import { VIDEO_QUEUE_NAME, type VideoJobData } from "./queue";
 import { createRedisConnection } from "./redis";
 import { prisma } from "./prisma";
-import { generateScript } from "./stages/script";
+import { generateCinematicScript } from "./stages/cinematic-script";
 import { generateVoiceover, VOICE_MAP } from "./stages/voice";
-import { fetchVisuals } from "./stages/visuals";
-import { assembleVideo } from "./stages/assemble";
-import { addSubtitles } from "./stages/subtitles";
+import { fetchCinematicVisuals } from "./stages/cinematic-visuals";
+import { assembleCinematicVideo } from "./stages/cinematic-assembly";
+import { addCinematicSubtitles } from "./stages/cinematic-subtitles";
 import { uploadToYouTube } from "./stages/upload";
 
 // ─── Stage definitions ────────────────────────────────────────────────────────
@@ -114,10 +114,12 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
       data: { status: "processing" },
     });
 
-    // ── Stage 1: Script ──────────────────────────────────────────────────────
-    console.log(`[Stage 1] Starting script generation for job ${jobId}`);
-    await stageActive(jobId, 1, `Writing ${duration} ${style} script`);
-    const script = await generateScript(
+    // ── Stage 1: Cinematic Script (Story Plan + Scene Script) ────────────────
+    console.log(`[Stage 1] Starting cinematic script generation for job ${jobId}`);
+    await stageActive(jobId, 1, `Planning cinematic ${duration} ${style} story`);
+    
+    // Use cinematic script generation (story plan + scene script)
+    const { storyPlan, script: cinematicScript } = await generateCinematicScript(
       jobId,
       prompt,
       style,
@@ -125,16 +127,20 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
       language,
       (log) => publishProgress(jobId, { stage: 1, name: STAGE_NAMES[0], status: "active", log })
     );
+    
     await prisma.video.update({
       where: { jobId },
       data: {
-        scriptJson: script as object,
-        title: script.title,
-        description: script.description,
-        tags: script.tags,
+        scenes: cinematicScript.scenes as any,
+        characters: cinematicScript.characters ? (cinematicScript.characters as any) : null,
+        scriptJson: cinematicScript as any,
+        title: cinematicScript.title,
+        description: cinematicScript.description,
+        tags: cinematicScript.tags,
       },
     });
-    console.log(`[Stage 1] Success - Script: "${script.title}" (${script.script.length} segments)`);
+    
+    console.log(`[Stage 1] Success - Cinematic Script: "${cinematicScript.title}" (${cinematicScript.scenes.length} scenes)`);
     await stageDone(jobId, 1);
 
     // ── Stage 2: Voiceover ───────────────────────────────────────────────────
@@ -142,12 +148,14 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
     await stageActive(jobId, 2, "Generating voiceover audio");
     const resolvedVoiceId = VOICE_MAP[voice] ?? voice;
     console.log(`[Stage 2] Voice: ${resolvedVoiceId}`);
+    
     const { s3Key: voiceS3Key, durationSeconds } = await generateVoiceover(
       jobId,
-      script.script,
+      cinematicScript.scenes.map(s => ({ segment: s.narration, duration_seconds: s.duration_seconds, visual_cue: s.visual_prompt })),
       resolvedVoiceId,
       (log) => publishProgress(jobId, { stage: 2, name: STAGE_NAMES[1], status: "active", log })
     );
+    
     await prisma.video.update({
       where: { jobId },
       data: { s3VoiceUrl: voiceS3Key },
@@ -155,55 +163,69 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
     console.log(`[Stage 2] Success - S3 Key: ${voiceS3Key}, Duration: ${durationSeconds.toFixed(1)}s`);
     await stageDone(jobId, 2);
 
-    // ── Stage 3: Visuals ─────────────────────────────────────────────────────
-    console.log(`[Stage 3] Starting visual fetching for job ${jobId}`);
+    // ── Stage 3: Cinematic Visuals ───────────────────────────────────────────
+    console.log(`[Stage 3] Starting cinematic visual fetching for job ${jobId}`);
     console.log(`[Stage 3] Temp directory: ${tmpDir}`);
-    await stageActive(jobId, 3, "Fetching stock footage and images");
-    const timeline = await fetchVisuals(
+    await stageActive(jobId, 3, "Fetching cinematic stock footage and images");
+    
+    const timeline = await fetchCinematicVisuals(
       jobId,
-      script.script,
+      cinematicScript.scenes,
+      cinematicScript.characters,
       durationSeconds,
       tmpDir,
       (log) => publishProgress(jobId, { stage: 3, name: STAGE_NAMES[2], status: "active", log })
     );
-    console.log(`[Stage 3] Success - Fetched ${timeline.length} visuals`);
+    
+    console.log(`[Stage 3] Success - Fetched ${timeline.length} cinematic visuals`);
     await stageDone(jobId, 3);
 
-    // ── Stage 4: Assembly ────────────────────────────────────────────────────
-    console.log(`[Stage 4] Starting video assembly for job ${jobId}`);
+    // ── Stage 4: Cinematic Assembly ──────────────────────────────────────────
+    console.log(`[Stage 4] Starting cinematic video assembly for job ${jobId}`);
     console.log(`[Stage 4] Voice S3 Key: ${voiceS3Key}`);
-    await stageActive(jobId, 4, "Assembling video with FFmpeg");
-    const rawVideoS3Key = await assembleVideo(
+    await stageActive(jobId, 4, "Assembling cinematic video with motion effects");
+    
+    const rawVideoS3Key = await assembleCinematicVideo(
       jobId,
       timeline,
       voiceS3Key,
       tmpDir,
       (log) => publishProgress(jobId, { stage: 4, name: STAGE_NAMES[3], status: "active", log })
     );
+    
     await prisma.video.update({
       where: { jobId },
       data: { s3RawVideoUrl: rawVideoS3Key },
     });
-    console.log(`[Stage 4] Success - Raw video S3 Key: ${rawVideoS3Key}`);
+    console.log(`[Stage 4] Success - Cinematic raw video S3 Key: ${rawVideoS3Key}`);
     await stageDone(jobId, 4);
 
-    // ── Stage 5: Subtitles ───────────────────────────────────────────────────
-    console.log(`[Stage 5] Starting subtitle burn-in for job ${jobId}`);
+    // ── Stage 5: Cinematic Subtitles ─────────────────────────────────────────
+    console.log(`[Stage 5] Starting cinematic subtitle burn-in for job ${jobId}`);
     console.log(`[Stage 5] Raw video S3 Key: ${rawVideoS3Key}`);
-    await stageActive(jobId, 5, "Burning subtitles into video");
-    const finalVideoS3Key = await addSubtitles(
+    await stageActive(jobId, 5, "Burning cinematic subtitles into video");
+    
+    const finalVideoS3Key = await addCinematicSubtitles(
       jobId,
-      script.script,
+      cinematicScript.scenes,
       timeline,
       rawVideoS3Key,
       tmpDir,
+      {
+        fontSize: 18,
+        maxCharsPerLine: 42,
+        maxLines: 2,
+        fadeInDuration: 0.2,
+        fadeOutDuration: 0.2,
+      },
       (log) => publishProgress(jobId, { stage: 5, name: STAGE_NAMES[4], status: "active", log })
     );
+    
     await prisma.video.update({
       where: { jobId },
       data: { s3VideoUrl: finalVideoS3Key },
     });
-    console.log(`[Stage 5] Success - Final video S3 Key: ${finalVideoS3Key}`);
+    console.log(`[Stage 5] Success - Final cinematic video S3 Key: ${finalVideoS3Key}`);
     await stageDone(jobId, 5);
 
     // ── Stage 6: YouTube Upload ──────────────────────────────────────────────
@@ -216,9 +238,9 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
         jobId,
         userId,
         finalVideoS3Key,
-        script.title,
-        script.description,
-        script.tags,
+        cinematicScript.title,
+        cinematicScript.description,
+        cinematicScript.tags,
         visibility,
         tmpDir,
         (log) => publishProgress(jobId, { stage: 6, name: STAGE_NAMES[5], status: "active", log })
@@ -251,7 +273,9 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
         where: { jobId },
         data: { 
           status: "completed",
-          errorMessage: `YouTube upload failed: ${uploadError}. Video is available for download.`
+          renderStatus: "completed",
+          uploadStatus: "failed",
+          uploadError: `YouTube upload failed: ${uploadError}. Video is available for download.`,
         },
       });
 
@@ -269,7 +293,11 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
 
     await prisma.video.update({
       where: { jobId },
-      data: { status: "failed", errorMessage },
+      data: { 
+        status: "failed",
+        renderStatus: "failed",
+        renderError: errorMessage,
+      },
     });
 
     // Determine which stage failed

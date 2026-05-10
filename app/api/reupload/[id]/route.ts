@@ -47,9 +47,12 @@ export async function POST(
     data: {
       jobId: newJobId,
       status: "processing",
+      renderStatus: "processing",
+      uploadStatus: "not_started",
       youtubeId: null,
       youtubeUrl: null,
-      errorMessage: null,
+      renderError: null,
+      uploadError: null,
       visibility,
     },
   });
