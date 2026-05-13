@@ -8,6 +8,8 @@ import { motion } from "framer-motion";
 import { Sparkles, Video, TrendingUp, CheckCircle, XCircle } from "lucide-react";
 import Link from "next/link";
 import { VideoCard } from "@/components/VideoCard";
+import { AuthGuard } from "@/components/auth/AuthGuard";
+import { auth } from "@/lib/firebase";
 
 type VideoStatus = "all" | "completed" | "failed" | "processing" | "pending";
 
@@ -49,11 +51,31 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch("/api/dashboard")
-      .then((r) => r.json())
-      .then((d) => setData(d))
-      .catch(console.error)
-      .finally(() => setLoading(false));
+    async function fetchDashboard() {
+      try {
+        const user = auth.currentUser;
+        if (!user) return;
+
+        // Use cached token
+        const token = await user.getIdToken(false);
+        const res = await fetch("/api/dashboard", {
+          headers: {
+            "Authorization": `Bearer ${token}`,
+          },
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          setData(data);
+        }
+      } catch (error) {
+        console.error("[dashboard] Error:", error);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchDashboard();
   }, []);
 
   const filtered =
@@ -62,7 +84,8 @@ export default function DashboardPage() {
       : (data?.videos ?? []).filter((v) => v.status === filter);
 
   return (
-    <main className="min-h-screen px-4 py-16">
+    <AuthGuard>
+      <main className="min-h-screen px-4 py-16">
       {/* Nav */}
       <nav className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between px-6 py-4 border-b border-[#1f1f1f]/50 backdrop-blur-sm bg-[#080808]/80">
         <Link href="/" className="flex items-center gap-2">
@@ -198,6 +221,7 @@ export default function DashboardPage() {
         )}
       </div>
     </main>
+    </AuthGuard>
   );
 }
 

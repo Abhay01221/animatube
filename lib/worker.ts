@@ -18,6 +18,7 @@ import { fetchCinematicVisuals } from "./stages/cinematic-visuals";
 import { assembleCinematicVideo } from "./stages/cinematic-assembly";
 import { addCinematicSubtitles } from "./stages/cinematic-subtitles";
 import { uploadToYouTube } from "./stages/upload";
+import { uploadFinalVideoToStorage, cleanupTempFiles } from "./storage";
 
 // ─── Stage definitions ────────────────────────────────────────────────────────
 export type StageStatus = "pending" | "active" | "done" | "error";
@@ -228,16 +229,38 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
     console.log(`[Stage 5] Success - Final cinematic video S3 Key: ${finalVideoS3Key}`);
     await stageDone(jobId, 5);
 
+    // ── CRITICAL: Upload final video to permanent storage ────────────────────
+    console.log(`[Storage] Uploading final video to permanent storage`);
+    const finalVideoPath = path.join(tmpDir, "final_video.mp4");
+    const { videoS3Key: permanentS3Key, videoUrl, thumbnailUrl } = await uploadFinalVideoToStorage(
+      jobId,
+      finalVideoPath,
+      tmpDir
+    );
+    
+    // Update database with permanent storage URLs
+    await prisma.video.update({
+      where: { jobId },
+      data: { 
+        s3VideoUrl: permanentS3Key,
+        thumbnailUrl: thumbnailUrl || null,
+        renderStatus: "completed",
+      },
+    });
+    
+    console.log(`[Storage] ✓ Final video permanently stored: ${permanentS3Key}`);
+    console.log(`[Storage] ✓ Video URL: ${videoUrl}`);
+
     // ── Stage 6: YouTube Upload ──────────────────────────────────────────────
     await stageActive(jobId, 6, "Uploading to YouTube");
-    console.log(`[Stage 6] Final video uploaded to S3: ${finalVideoS3Key}`);
+    console.log(`[Stage 6] Final video uploaded to S3: ${permanentS3Key}`);
     console.log(`[Stage 6] Generated download URL available`);
     
     try {
       const { youtubeId, youtubeUrl } = await uploadToYouTube(
         jobId,
         userId,
-        finalVideoS3Key,
+        permanentS3Key,
         cinematicScript.title,
         cinematicScript.description,
         cinematicScript.tags,
@@ -250,7 +273,13 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
       // ── Complete with YouTube upload ───────────────────────────────────────
       await prisma.video.update({
         where: { jobId },
-        data: { status: "completed", youtubeId, youtubeUrl },
+        data: { 
+          status: "completed",
+          renderStatus: "completed",
+          uploadStatus: "uploaded",
+          youtubeId, 
+          youtubeUrl,
+        },
       });
 
       // Publish completion event
@@ -307,11 +336,7 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
     throw err; // Let BullMQ handle retries
   } finally {
     // Always clean up temp directory
-    try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch {
-      // Non-fatal
-    }
+    await cleanupTempFiles(tmpDir);
   }
 }
 

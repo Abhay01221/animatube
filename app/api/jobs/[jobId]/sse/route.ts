@@ -4,7 +4,7 @@
  * Reads from Redis pub/sub and the progress list.
  */
 import { NextRequest } from "next/server";
-import { auth } from "@/lib/auth";
+import { verifyIdToken } from "@/lib/firebase-admin";
 import { prisma } from "@/lib/prisma";
 import { createRedisConnection } from "@/lib/redis";
 
@@ -15,16 +15,36 @@ export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ jobId: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
+  // Verify Firebase token
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return new Response("Unauthorized", { status: 401 });
+  }
+
+  const token = authHeader.split("Bearer ")[1];
+  
+  let decoded;
+  try {
+    decoded = await verifyIdToken(token);
+  } catch (error) {
+    console.error("[sse] Token verification failed:", error);
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  // Find user by Firebase UID
+  const currentUser = await prisma.user.findUnique({
+    where: { firebaseUid: decoded.uid },
+  });
+
+  if (!currentUser) {
+    return new Response("User not found. Please sign in again.", { status: 401 });
   }
 
   const { jobId } = await params;
 
   // Verify the job belongs to this user
   const video = await prisma.video.findUnique({ where: { jobId } });
-  if (!video || video.userId !== session.user.id) {
+  if (!video || video.userId !== currentUser.id) {
     return new Response("Not found", { status: 404 });
   }
 

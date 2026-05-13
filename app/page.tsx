@@ -7,7 +7,9 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { Sparkles, LogIn, LogOut } from "lucide-react";
-import { signIn, signOut, useSession } from "next-auth/react";
+import { signOut } from "firebase/auth";
+import { auth } from "@/lib/firebase";
+import { useAuth } from "@/components/auth/AuthProvider";
 import { Textarea } from "@/components/ui/textarea";
 import { AdvancedOptions, type VideoOptions } from "@/components/AdvancedOptions";
 import { toast } from "sonner";
@@ -22,13 +24,10 @@ const DEFAULT_OPTIONS: VideoOptions = {
 
 export default function HomePage() {
   const router = useRouter();
-  const { data: session, status } = useSession();
+  const { user, loading: authLoading } = useAuth();
   const [prompt, setPrompt] = useState("");
   const [options, setOptions] = useState<VideoOptions>(DEFAULT_OPTIONS);
   const [loading, setLoading] = useState(false);
-
-  console.log("[HomePage] Session status:", status);
-  console.log("[HomePage] Session data:", session);
 
   async function handleGenerate() {
     if (prompt.trim().length < 10) {
@@ -36,21 +35,38 @@ export default function HomePage() {
       return;
     }
 
+    if (!user) {
+      toast.error("Please sign in to generate videos.");
+      router.push("/sign-in");
+      return;
+    }
+
     setLoading(true);
     try {
+      // Use cached token
+      const token = await user.getIdToken(false);
       const res = await fetch("/api/generate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
         body: JSON.stringify({ prompt: prompt.trim(), ...options }),
       });
 
       if (res.status === 401) {
-        toast.error("Please sign in with Google to generate videos.");
+        toast.error("Please sign in to generate videos.");
+        router.push("/sign-in");
         return;
       }
 
       if (res.status === 429) {
         toast.error("Rate limit reached. Max 5 videos per hour.");
+        return;
+      }
+
+      if (res.status === 402) {
+        toast.error("No credits remaining. Please purchase more credits.");
         return;
       }
 
@@ -66,6 +82,15 @@ export default function HomePage() {
       toast.error("Network error. Please check your connection.");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleSignOut() {
+    try {
+      await signOut(auth);
+      toast.success("Signed out successfully");
+    } catch (error) {
+      toast.error("Failed to sign out");
     }
   }
 
@@ -97,19 +122,19 @@ export default function HomePage() {
           >
             Settings
           </a>
-          {status === "loading" ? (
+          {authLoading ? (
             <div className="w-20 h-8 bg-zinc-800 animate-pulse rounded-md" />
-          ) : session ? (
+          ) : user ? (
             <div className="flex items-center gap-3">
-              {session.user?.image && (
+              {user.photoURL && (
                 <img 
-                  src={session.user.image} 
-                  alt={session.user.name || "User"} 
+                  src={user.photoURL} 
+                  alt={user.displayName || "User"} 
                   className="w-7 h-7 rounded-full border border-zinc-700"
                 />
               )}
               <button
-                onClick={() => signOut({ callbackUrl: "/" })}
+                onClick={handleSignOut}
                 className="flex items-center gap-1.5 text-sm px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-white rounded-md transition-colors duration-300"
               >
                 <LogOut className="w-3.5 h-3.5" />
@@ -117,13 +142,13 @@ export default function HomePage() {
               </button>
             </div>
           ) : (
-            <button
-              onClick={() => signIn("google", { callbackUrl: "/" })}
+            <a
+              href="/sign-in"
               className="flex items-center gap-1.5 text-sm px-3 py-1.5 bg-violet-600 hover:bg-violet-500 text-white rounded-md transition-colors duration-300"
             >
               <LogIn className="w-3.5 h-3.5" />
               Sign in
-            </button>
+            </a>
           )}
         </div>
       </nav>

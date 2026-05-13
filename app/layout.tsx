@@ -2,8 +2,7 @@ import type { Metadata } from "next";
 import { Geist } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/sonner";
-import { Providers } from "@/components/Providers";
-import { auth } from "@/lib/auth";
+import { AuthProvider } from "@/components/auth/AuthProvider";
 
 const geist = Geist({
   subsets: ["latin"],
@@ -17,17 +16,15 @@ export const metadata: Metadata = {
   icons: { icon: "/favicon.ico" },
 };
 
-export default async function RootLayout({
+export default function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  const session = await auth();
-  
   return (
     <html lang="en" className={geist.variable}>
       <body className="min-h-screen bg-[#080808] text-zinc-100 antialiased">
-        <Providers session={session}>
+        <AuthProvider>
           {children}
           <Toaster
             theme="dark"
@@ -39,7 +36,7 @@ export default async function RootLayout({
               },
             }}
           />
-        </Providers>
+        </AuthProvider>
       </body>
     </html>
   );

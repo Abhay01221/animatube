@@ -3,7 +3,7 @@
  * Re-triggers the YouTube upload stage for an existing completed video.
  */
 import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
+import { verifyIdToken } from "@/lib/firebase-admin";
 import { prisma } from "@/lib/prisma";
 import { videoQueue } from "@/lib/queue";
 
@@ -11,15 +11,38 @@ export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth();
-  if (!session?.user?.id) {
+  // Verify Firebase token
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const token = authHeader.split("Bearer ")[1];
+  
+  let decoded;
+  try {
+    decoded = await verifyIdToken(token);
+  } catch (error) {
+    console.error("[reupload] Token verification failed:", error);
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Find user by Firebase UID
+  const currentUser = await prisma.user.findUnique({
+    where: { firebaseUid: decoded.uid },
+  });
+
+  if (!currentUser) {
+    return NextResponse.json(
+      { error: "User not found. Please sign in again." },
+      { status: 401 }
+    );
   }
 
   const { id } = await params;
 
   const video = await prisma.video.findUnique({ where: { id } });
-  if (!video || video.userId !== session.user.id) {
+  if (!video || video.userId !== currentUser.id) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
@@ -61,7 +84,7 @@ export async function POST(
     "reupload-video",
     {
       jobId: newJobId,
-      userId: session.user.id,
+      userId: currentUser.id,
       prompt: video.prompt,
       style: video.style,
       duration: video.duration,

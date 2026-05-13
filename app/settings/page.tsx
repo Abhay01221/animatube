@@ -21,6 +21,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { toast } from "sonner";
+import { auth } from "@/lib/firebase";
+import { signOut } from "firebase/auth";
+import { AuthGuard } from "@/components/auth/AuthGuard";
 
 interface UserSettings {
   defaultVoice?: string;
@@ -44,22 +47,55 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch("/api/settings")
-      .then((r) => r.json())
-      .then((d: SettingsData) => {
+    async function loadSettings() {
+      try {
+        const user = auth.currentUser;
+        if (!user) {
+          toast.error("Not authenticated");
+          setLoading(false);
+          return;
+        }
+
+        // Use cached token
+        const token = await user.getIdToken(false);
+        const res = await fetch("/api/settings", {
+          headers: {
+            "Authorization": `Bearer ${token}`,
+          },
+        });
+
+        if (!res.ok) throw new Error("Failed to load");
+        
+        const d: SettingsData = await res.json();
         setData(d);
         setSettings(d.settings ?? {});
-      })
-      .catch(() => toast.error("Failed to load settings"))
-      .finally(() => setLoading(false));
+      } catch (error) {
+        toast.error("Failed to load settings");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    loadSettings();
   }, []);
 
   async function handleSave() {
     setSaving(true);
     try {
+      const user = auth.currentUser;
+      if (!user) {
+        toast.error("Not authenticated");
+        return;
+      }
+
+      // Use cached token
+      const token = await user.getIdToken(false);
       const res = await fetch("/api/settings", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
         body: JSON.stringify(settings),
       });
       if (!res.ok) throw new Error("Save failed");
@@ -68,6 +104,15 @@ export default function SettingsPage() {
       toast.error("Failed to save settings");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleSignOut() {
+    try {
+      await signOut(auth);
+      window.location.href = "/sign-in";
+    } catch (error) {
+      toast.error("Failed to sign out");
     }
   }
 
@@ -84,7 +129,8 @@ export default function SettingsPage() {
   }
 
   return (
-    <main className="min-h-screen px-4 py-16">
+    <AuthGuard>
+      <main className="min-h-screen px-4 py-16">
       {/* Nav */}
       <nav className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between px-6 py-4 border-b border-[#1f1f1f]/50 backdrop-blur-sm bg-[#080808]/80">
         <Link href="/" className="flex items-center gap-2">
@@ -136,13 +182,13 @@ export default function SettingsPage() {
                   <p className="text-zinc-200 font-medium">{data.name}</p>
                   <p className="text-zinc-500 text-sm">{data.email}</p>
                 </div>
-                <a
-                  href="/api/auth/signout"
+                <button
+                  onClick={handleSignOut}
                   className="ml-auto flex items-center gap-1.5 text-sm text-zinc-500 hover:text-zinc-300 transition-colors duration-300"
                 >
                   <LogOut className="w-4 h-4" />
                   Sign out
-                </a>
+                </button>
               </div>
             </motion.section>
           )}
@@ -330,5 +376,6 @@ export default function SettingsPage() {
         </div>
       </div>
     </main>
+    </AuthGuard>
   );
 }

@@ -5,7 +5,7 @@
  * Available as soon as renderStatus is "completed".
  */
 import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
+import { verifyIdToken } from "@/lib/firebase-admin";
 import { prisma } from "@/lib/prisma";
 import * as fs from "fs";
 import * as path from "path";
@@ -16,16 +16,40 @@ export async function GET(
 ) {
   try {
     const { id: projectId } = await params;
-    const session = await auth();
-    if (!session?.user?.email) {
+    
+    // Verify Firebase token
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const token = authHeader.split("Bearer ")[1];
+    
+    let decoded;
+    try {
+      decoded = await verifyIdToken(token);
+    } catch (error) {
+      console.error("[project-download] Token verification failed:", error);
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    // Find user by Firebase UID
+    const currentUser = await prisma.user.findUnique({
+      where: { firebaseUid: decoded.uid },
+    });
+
+    if (!currentUser) {
+      return NextResponse.json(
+        { error: "User not found. Please sign in again." },
+        { status: 401 }
+      );
     }
 
     // Find the video project
     const video = await prisma.video.findFirst({
       where: {
         id: projectId,
-        user: { email: session.user.email },
+        userId: currentUser.id,
       },
     });
 

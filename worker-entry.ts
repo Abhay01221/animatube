@@ -1,40 +1,39 @@
 /**
- * Worker entry point — run this as a separate process:
+ * Worker Entry Point
+ * 
+ * Starts BullMQ workers for video generation.
+ * Run this as a separate process from the Next.js frontend.
+ * 
+ * Usage:
+ *   npm run worker
+ *   OR
  *   npx tsx worker-entry.ts
- *
- * This process handles both video rendering and YouTube upload jobs.
  */
-import dotenv from "dotenv";
-import path from "path";
+import { createWorker } from "./lib/worker";
 
-// Load .env before importing anything else — must be first
-dotenv.config({ path: path.resolve(process.cwd(), ".env") });
+console.log("========================================");
+console.log("🚀 Animatube Worker Starting");
+console.log("========================================");
+console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
+console.log(`Redis URL: ${process.env.REDIS_URL?.replace(/:\/\/.*@/, "://<credentials>@")}`);
+console.log(`Database: ${process.env.DATABASE_URL?.split("@")[1] || "not configured"}`);
+console.log(`S3 Bucket: ${process.env.AWS_S3_BUCKET || "not configured"}`);
+console.log("========================================\n");
 
-import { createVideoWorker } from "./lib/workers/video-worker";
-import { createUploadWorker } from "./lib/workers/upload-worker";
-
-console.log("[Worker] Starting Animatube workers...");
-console.log("[Worker] GROQ_API_KEY present:", !!process.env.GROQ_API_KEY);
-console.log("[Worker] DATABASE_URL present:", !!process.env.DATABASE_URL);
-console.log("[Worker] AWS_S3_BUCKET:", process.env.AWS_S3_BUCKET);
-
-// Start both workers
-const videoWorker = createVideoWorker();
-const uploadWorker = createUploadWorker();
-
-console.log("[Worker] Video rendering worker started");
-console.log("[Worker] YouTube upload worker started");
+// Create and start worker
+const worker = createWorker();
 
 // Graceful shutdown
-async function shutdown() {
-  console.log("[Worker] Shutting down gracefully...");
-  await videoWorker.close();
-  await uploadWorker.close();
+process.on("SIGTERM", async () => {
+  console.log("\n⚠️  SIGTERM received, shutting down gracefully...");
+  await worker.close();
   process.exit(0);
-}
+});
 
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+process.on("SIGINT", async () => {
+  console.log("\n⚠️  SIGINT received, shutting down gracefully...");
+  await worker.close();
+  process.exit(0);
+});
 
-console.log("[Worker] Workers ready, waiting for jobs...");
-
+console.log("✅ Worker is running and waiting for jobs...\n");

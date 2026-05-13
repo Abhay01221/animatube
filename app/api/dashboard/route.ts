@@ -3,18 +3,41 @@
  * Returns the authenticated user's video history with granular status.
  */
 import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
+import { verifyIdToken } from "@/lib/firebase-admin";
 import { prisma } from "@/lib/prisma";
-import { getFileSize } from "@/lib/local-storage";
+import { getPresignedUrl } from "@/lib/s3";
 
-export async function GET(_req: NextRequest) {
-  const session = await auth();
-  if (!session?.user?.id) {
+export async function GET(req: NextRequest) {
+  // Verify Firebase token
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const token = authHeader.split("Bearer ")[1];
+  
+  let decoded;
+  try {
+    decoded = await verifyIdToken(token);
+  } catch (error) {
+    console.error("[dashboard] Token verification failed:", error);
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Find user by Firebase UID
+  const currentUser = await prisma.user.findUnique({
+    where: { firebaseUid: decoded.uid },
+  });
+
+  if (!currentUser) {
+    return NextResponse.json(
+      { error: "User not found. Please sign in again." },
+      { status: 401 }
+    );
+  }
+
   const videos = await prisma.video.findMany({
-    where: { userId: session.user.id },
+    where: { userId: currentUser.id },
     orderBy: { createdAt: "desc" },
     select: {
       id: true,
@@ -27,10 +50,10 @@ export async function GET(_req: NextRequest) {
       style: true,
       duration: true,
       title: true,
-      localFilePath: true,
       youtubeId: true,
       youtubeUrl: true,
       s3VideoUrl: true,
+      thumbnailUrl: true,
       renderError: true,
       uploadError: true,
       createdAt: true,
@@ -38,22 +61,32 @@ export async function GET(_req: NextRequest) {
     },
   });
 
-  // Enhance with file size and download URL
-  const enhancedVideos = videos.map((video) => {
-    const fileSizeMB = video.localFilePath ? getFileSize(video.jobId) : null;
-    const fileSizeFormatted = fileSizeMB 
-      ? `${(fileSizeMB / 1024 / 1024).toFixed(2)} MB`
-      : null;
+  // Enhance with presigned URLs for video playback and download
+  const enhancedVideos = await Promise.all(
+    videos.map(async (video: typeof videos[number]) => {
+      let videoUrl: string | null = null;
+      let downloadUrl: string | null = null;
 
-    return {
-      ...video,
-      fileSizeMB: fileSizeMB ? fileSizeMB / 1024 / 1024 : null,
-      fileSizeFormatted,
-      downloadUrl: video.renderStatus === "completed" && video.localFilePath
-        ? `/api/projects/${video.id}/download`
-        : null,
-    };
-  });
+      // Generate presigned URLs for completed videos
+      if (video.renderStatus === "completed" && video.s3VideoUrl) {
+        try {
+          // 7-day presigned URL for playback
+          videoUrl = await getPresignedUrl(video.s3VideoUrl, 604800);
+          // Download URL via API (generates fresh presigned URL)
+          downloadUrl = `/api/download/${video.id}`;
+        } catch (err) {
+          console.error(`Failed to generate presigned URL for ${video.jobId}:`, err);
+        }
+      }
+
+      return {
+        ...video,
+        videoUrl, // Direct playback URL
+        downloadUrl, // API endpoint for download
+        // Thumbnail URL is already presigned in database
+      };
+    })
+  );
 
   // Stats
   const now = new Date();

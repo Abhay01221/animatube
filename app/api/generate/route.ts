@@ -1,11 +1,12 @@
 /**
  * POST /api/generate
- * Validates input, creates a BullMQ job, returns jobId.
+ * Validates input, checks credits, creates a BullMQ job, returns jobId.
  * Rate limited to 5 requests/hour per user.
+ * Deducts 1 credit atomically to prevent race conditions.
  */
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { auth } from "@/lib/auth";
+import { verifyIdToken } from "@/lib/firebase-admin";
 import { videoQueue, type VideoJobData } from "@/lib/queue";
 import { prisma } from "@/lib/prisma";
 import { Ratelimit } from "@upstash/ratelimit";
@@ -33,13 +34,35 @@ if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) 
 }
 
 export async function POST(req: NextRequest) {
-  // Auth check
-  const session = await auth();
-  if (!session?.user?.id) {
+  // Firebase token verification
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const userId = session.user.id;
+  const token = authHeader.split("Bearer ")[1];
+  
+  let decoded;
+  try {
+    decoded = await verifyIdToken(token);
+  } catch (error) {
+    console.error("[generate] Token verification failed:", error);
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Find user by Firebase UID
+  const user = await prisma.user.findUnique({
+    where: { firebaseUid: decoded.uid },
+  });
+
+  if (!user) {
+    return NextResponse.json(
+      { error: "User not found. Please sign in again." },
+      { status: 401 }
+    );
+  }
+
+  const userId = user.id;
 
   // Rate limiting
   if (ratelimit) {
@@ -70,7 +93,38 @@ export async function POST(req: NextRequest) {
 
   const { prompt, style, duration, voice, language, visibility } = parsed.data;
 
-  // Create DB record first (so we have a jobId)
+  // Credit check and deduction (atomic transaction to prevent race conditions)
+  try {
+    await prisma.$transaction(async (tx) => {
+      const user = await tx.user.findUnique({
+        where: { id: userId },
+        select: { credits: true },
+      });
+
+      if (!user || user.credits <= 0) {
+        throw new Error("NO_CREDITS");
+      }
+
+      // Deduct credit atomically
+      await tx.user.update({
+        where: { id: userId },
+        data: {
+          credits: { decrement: 1 },
+          videosGenerated: { increment: 1 },
+        },
+      });
+    });
+  } catch (error: any) {
+    if (error.message === "NO_CREDITS") {
+      return NextResponse.json(
+        { error: "No credits remaining" },
+        { status: 402 }
+      );
+    }
+    throw error;
+  }
+
+  // Create DB record (so we have a jobId)
   const video = await prisma.video.create({
     data: {
       userId,

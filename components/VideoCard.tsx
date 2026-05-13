@@ -8,6 +8,7 @@ import { motion } from "framer-motion";
 import { ExternalLink, Download, RefreshCw, Play } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
+import { auth } from "@/lib/firebase";
 
 interface VideoCardProps {
   video: {
@@ -16,12 +17,19 @@ interface VideoCardProps {
     title?: string | null;
     prompt: string;
     status: string;
+    renderStatus?: string;
+    uploadStatus?: string;
     style: string;
     duration: string;
     youtubeUrl?: string | null;
     youtubeId?: string | null;
     s3VideoUrl?: string | null;
+    videoUrl?: string | null; // Presigned playback URL
+    downloadUrl?: string | null; // Download API endpoint
+    thumbnailUrl?: string | null;
     errorMessage?: string | null;
+    renderError?: string | null;
+    uploadError?: string | null;
     createdAt: string;
   };
   onReupload?: (id: string) => void;
@@ -49,12 +57,36 @@ export function VideoCard({ video, onReupload }: VideoCardProps) {
     year: "numeric",
   });
 
+  // Use thumbnail if available, otherwise fallback to YouTube thumbnail
+  const thumbnailUrl = video.thumbnailUrl || 
+    (video.youtubeId ? `https://img.youtube.com/vi/${video.youtubeId}/mqdefault.jpg` : null);
+
+  // Determine if video is playable
+  const isPlayable = video.renderStatus === "completed" && (video.videoUrl || video.s3VideoUrl);
+  const isDownloadable = video.renderStatus === "completed" && video.downloadUrl;
+
   async function handleDownload() {
+    if (!video.downloadUrl) {
+      toast.error("Download not available");
+      return;
+    }
+
     setDownloading(true);
     toast.loading("Preparing download...", { id: "download-" + video.id });
 
     try {
-      const res = await fetch(`/api/download/${video.id}`);
+      const user = auth.currentUser;
+      if (!user) {
+        toast.error("You must be signed in to download", { id: "download-" + video.id });
+        return;
+      }
+
+      const token = await user.getIdToken(true);
+      const res = await fetch(video.downloadUrl, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
       
       if (!res.ok) {
         const error = await res.json();
@@ -70,14 +102,12 @@ export function VideoCard({ video, onReupload }: VideoCardProps) {
       toast.success("Starting download...", { id: "download-" + video.id });
       
       // Trigger browser download
-      window.open(data.url, "_blank");
-      
-      // Fallback: if window.open is blocked, use location.href
-      setTimeout(() => {
-        if (!document.hasFocus()) {
-          window.location.href = data.url;
-        }
-      }, 100);
+      const link = document.createElement("a");
+      link.href = data.url;
+      link.download = `${video.title || video.jobId}.mp4`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
       
     } catch (err) {
       console.error("Download failed:", err);
@@ -90,7 +120,18 @@ export function VideoCard({ video, onReupload }: VideoCardProps) {
   async function handleReupload() {
     setReuploading(true);
     try {
-      const res = await fetch(`/api/reupload/${video.id}`, { method: "POST" });
+      const user = auth.currentUser;
+      if (!user) {
+        toast.error("You must be signed in");
+        return;
+      }
+      const token = await user.getIdToken(false);
+      const res = await fetch(`/api/reupload/${video.id}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
       const data = await res.json();
       if (data.jobId) {
         onReupload?.(video.id);
@@ -109,15 +150,24 @@ export function VideoCard({ video, onReupload }: VideoCardProps) {
     >
       {/* Thumbnail / Poster */}
       <div className="relative aspect-video bg-zinc-900 overflow-hidden">
-        {video.youtubeId ? (
+        {thumbnailUrl ? (
           <img
-            src={`https://img.youtube.com/vi/${video.youtubeId}/mqdefault.jpg`}
+            src={thumbnailUrl}
             alt={title}
             className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
           />
         ) : (
           <div className="w-full h-full flex items-center justify-center">
             <Play className="w-10 h-10 text-zinc-700" />
+          </div>
+        )}
+
+        {/* Play button overlay for playable videos */}
+        {isPlayable && (
+          <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 flex items-center justify-center transition-all duration-300">
+            <div className="w-12 h-12 rounded-full bg-white/90 flex items-center justify-center opacity-0 group-hover:opacity-100 transform scale-75 group-hover:scale-100 transition-all duration-300">
+              <Play className="w-6 h-6 text-black ml-1" />
+            </div>
           </div>
         )}
 
@@ -154,9 +204,15 @@ export function VideoCard({ video, onReupload }: VideoCardProps) {
           <span>{date}</span>
         </div>
 
-        {video.errorMessage && (
+        {video.renderError && (
           <p className="text-xs text-red-400 mb-3 line-clamp-2">
-            {video.errorMessage}
+            Render error: {video.renderError}
+          </p>
+        )}
+
+        {video.uploadError && (
+          <p className="text-xs text-amber-400 mb-3 line-clamp-2">
+            Upload error: {video.uploadError}
           </p>
         )}
 
@@ -174,7 +230,7 @@ export function VideoCard({ video, onReupload }: VideoCardProps) {
             </a>
           )}
 
-          {video.s3VideoUrl && (
+          {isDownloadable && (
             <button
               onClick={handleDownload}
               disabled={downloading}
@@ -185,7 +241,7 @@ export function VideoCard({ video, onReupload }: VideoCardProps) {
             </button>
           )}
 
-          {(video.status === "completed" || video.status === "failed") &&
+          {(video.renderStatus === "completed" || video.status === "failed") &&
             video.s3VideoUrl && (
               <button
                 onClick={handleReupload}

@@ -50,6 +50,7 @@ model VerificationToken {
 
 model User {
   id            String    @id @default(cuid())
+  firebaseUid   String?   @unique // ← ADDED (Firebase Authentication UID)
   name          String?
   email         String    @unique
   emailVerified DateTime?
@@ -61,6 +62,10 @@ model User {
 
   // User preferences stored as JSON
   settings Json?
+
+  // Usage limits
+  credits         Int @default(5)
+  videosGenerated Int @default(0)
 
   accounts Account[]
   sessions Session[]
@@ -110,6 +115,9 @@ model Video {
   s3VoiceUrl    String?
   s3VideoUrl    String? // final_video.mp4
   s3RawVideoUrl String? // raw_video.mp4 (before subtitles)
+
+  // Supabase Storage public URL for the final rendered video
+  videoUrl      String? // permanent public URL (Supabase Storage)
 
   // YouTube upload (completely optional)
   youtubeId    String?

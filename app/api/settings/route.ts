@@ -4,7 +4,7 @@
  */
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { auth } from "@/lib/auth";
+import { verifyIdToken } from "@/lib/firebase-admin";
 import { prisma } from "@/lib/prisma";
 
 const SettingsSchema = z.object({
@@ -16,14 +16,37 @@ const SettingsSchema = z.object({
     .optional(),
 });
 
-export async function GET(_req: NextRequest) {
-  const session = await auth();
-  if (!session?.user?.id) {
+export async function GET(req: NextRequest) {
+  // Verify Firebase token
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const token = authHeader.split("Bearer ")[1];
+  
+  let decoded;
+  try {
+    decoded = await verifyIdToken(token);
+  } catch (error) {
+    console.error("[settings] Token verification failed:", error);
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Find user by Firebase UID
+  const currentUser = await prisma.user.findUnique({
+    where: { firebaseUid: decoded.uid },
+  });
+
+  if (!currentUser) {
+    return NextResponse.json(
+      { error: "User not found. Please sign in again." },
+      { status: 401 }
+    );
+  }
+
   const user = await prisma.user.findUnique({
-    where: { id: session.user.id },
+    where: { id: currentUser.id },
     select: {
       settings: true,
       youtubeTokens: true,
@@ -43,9 +66,32 @@ export async function GET(_req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const session = await auth();
-  if (!session?.user?.id) {
+  // Verify Firebase token
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const token = authHeader.split("Bearer ")[1];
+  
+  let decoded;
+  try {
+    decoded = await verifyIdToken(token);
+  } catch (error) {
+    console.error("[settings] Token verification failed:", error);
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Find user by Firebase UID
+  const currentUser = await prisma.user.findUnique({
+    where: { firebaseUid: decoded.uid },
+  });
+
+  if (!currentUser) {
+    return NextResponse.json(
+      { error: "User not found. Please sign in again." },
+      { status: 401 }
+    );
   }
 
   let body: unknown;
@@ -64,7 +110,7 @@ export async function POST(req: NextRequest) {
   }
 
   const user = await prisma.user.update({
-    where: { id: session.user.id },
+    where: { id: currentUser.id },
     data: { settings: parsed.data },
     select: { settings: true },
   });
