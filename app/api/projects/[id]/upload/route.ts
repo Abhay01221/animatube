@@ -7,7 +7,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyIdToken } from "@/lib/firebase-admin";
 import { prisma } from "@/lib/prisma";
-import { uploadQueue } from "@/lib/queue";
+import { getUploadQueue } from "@/lib/queue";
 
 export async function POST(
   req: NextRequest,
@@ -92,7 +92,7 @@ export async function POST(
     }
 
     // Queue the upload job
-    await uploadQueue.add("upload-video", {
+    await getUploadQueue().add("upload-video", {
       jobId: video.jobId,
       userId: video.userId,
       localFilePath: video.localFilePath,

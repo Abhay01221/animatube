@@ -7,7 +7,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { verifyIdToken } from "@/lib/firebase-admin";
-import { videoQueue, type VideoJobData } from "@/lib/queue";
+import { getVideoQueue, type VideoJobData } from "@/lib/queue";
 import { prisma } from "@/lib/prisma";
 import { Ratelimit } from "@upstash/ratelimit";
 import { Redis } from "@upstash/redis";
@@ -151,7 +151,7 @@ export async function POST(req: NextRequest) {
     visibility,
   };
 
-  await videoQueue.add("generate-video", jobData, {
+  await getVideoQueue().add("generate-video", jobData, {
     jobId: video.jobId,
   });
 

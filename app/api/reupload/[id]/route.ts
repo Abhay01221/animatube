@@ -5,7 +5,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyIdToken } from "@/lib/firebase-admin";
 import { prisma } from "@/lib/prisma";
-import { videoQueue } from "@/lib/queue";
+import { getVideoQueue } from "@/lib/queue";
 
 export async function POST(
   req: NextRequest,
@@ -80,7 +80,7 @@ export async function POST(
     },
   });
 
-  await videoQueue.add(
+  await getVideoQueue().add(
     "reupload-video",
     {
       jobId: newJobId,
