@@ -9,25 +9,45 @@
  *   import { supabaseAdmin } from "@/lib/supabase";
  *   await supabaseAdmin.storage.from("videos").upload(...)
  */
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+let _client: SupabaseClient | null = null;
 
-if (!supabaseUrl || !serviceRoleKey) {
-  throw new Error(
-    "Missing Supabase credentials. Set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env"
-  );
+/**
+ * Returns the singleton Supabase admin client.
+ * Lazy-initialised on first call so missing env vars only throw at
+ * request time (not at build time on Vercel).
+ */
+function getSupabaseAdmin(): SupabaseClient {
+  if (_client) return _client;
+
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error(
+      "Missing Supabase credentials. Set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in environment variables."
+    );
+  }
+
+  _client = createClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      // Disable auto-refresh and session persistence — not needed server-side
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+
+  return _client;
 }
 
 /**
- * Supabase admin client with service role key.
- * Bypasses Row Level Security — use only in server-side code.
+ * Supabase admin client proxy.
+ * Access it like a normal client: supabaseAdmin.storage.from(...)
+ * The real client is created lazily on first property access.
  */
-export const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey, {
-  auth: {
-    // Disable auto-refresh and session persistence — not needed for server-side usage
-    autoRefreshToken: false,
-    persistSession: false,
+export const supabaseAdmin = new Proxy({} as SupabaseClient, {
+  get(_target, prop) {
+    return (getSupabaseAdmin() as any)[prop];
   },
 });

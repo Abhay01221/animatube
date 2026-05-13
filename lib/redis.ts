@@ -1,19 +1,17 @@
 /**
  * Shared Redis connection for BullMQ and SSE progress.
  * Reads REDIS_URL from environment — supports rediss:// (TLS) for Upstash.
+ * Lazy-initialised so missing env vars only throw at request time, not build time.
  */
-import dotenv from "dotenv";
-import path from "path";
 import IORedis from "ioredis";
 
-dotenv.config({ path: path.resolve(process.cwd(), ".env") });
-
-const redisUrl = process.env.REDIS_URL;
-if (!redisUrl) {
-  throw new Error("REDIS_URL environment variable is not set");
+function getRedisUrl(): string {
+  const url = process.env.REDIS_URL;
+  if (!url) {
+    throw new Error("REDIS_URL environment variable is not set");
+  }
+  return url;
 }
-
-console.log("[Redis] Connecting to:", redisUrl.replace(/:\/\/.*@/, "://<credentials>@"));
 
 // Singleton Redis client for API routes (reused across requests)
 let singletonClient: IORedis | null = null;
@@ -32,12 +30,15 @@ export function getRedisClient(): IORedis {
     console.log("[Redis] Existing client not ready, creating new one");
   }
 
-  singletonClient = new IORedis(redisUrl!, {
+  const redisUrl = getRedisUrl();
+  console.log("[Redis] Connecting to:", redisUrl.replace(/:\/\/.*@/, "://<credentials>@"));
+
+  singletonClient = new IORedis(redisUrl, {
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
     lazyConnect: false,
     // TLS is required for rediss:// (Upstash and other managed Redis providers)
-    tls: redisUrl!.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
+    tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
     // Production-safe retry strategy
     retryStrategy: (times: number) => {
       const delay = Math.min(times * 50, 2000);
@@ -76,11 +77,12 @@ export function getRedisClient(): IORedis {
  * These connections CAN be closed with .quit() when done.
  */
 export function createRedisConnection(): IORedis {
-  const connection = new IORedis(redisUrl!, {
+  const redisUrl = getRedisUrl();
+  const connection = new IORedis(redisUrl, {
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
     // TLS is required for rediss:// (Upstash and other managed Redis providers)
-    tls: redisUrl!.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
+    tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
     // Production-safe retry strategy
     retryStrategy: (times: number) => {
       const delay = Math.min(times * 50, 2000);
