@@ -78,6 +78,7 @@ export function VideoCard({ video, onReupload }: VideoCardProps) {
       const user = auth.currentUser;
       if (!user) {
         toast.error("You must be signed in to download", { id: "download-" + video.id });
+        setDownloading(false);
         return;
       }
 
@@ -101,10 +102,13 @@ export function VideoCard({ video, onReupload }: VideoCardProps) {
 
       toast.success("Starting download...", { id: "download-" + video.id });
       
-      // Trigger browser download
+      // Trigger browser download.
+      // Content-Disposition: attachment is set server-side by Supabase/S3 signed URL,
+      // so the file saves to disk even though the URL is cross-origin.
       const link = document.createElement("a");
       link.href = data.url;
-      link.download = `${video.title || video.jobId}.mp4`;
+      // Keep download attribute as a fallback filename hint for same-origin cases.
+      link.download = (video.title || video.jobId).replace(/[^a-zA-Z0-9_\- ]/g, "").trim() || "video";
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);

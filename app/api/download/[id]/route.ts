@@ -55,7 +55,12 @@ export async function GET(
   }
 
   try {
-    const url = await getVideoDownloadUrl(video.videoUrl ?? null, video.s3VideoUrl ?? null);
+    const url = await getVideoDownloadUrl(
+      video.videoUrl ?? null,
+      video.s3VideoUrl ?? null,
+      "download",
+      video.title ?? null
+    );
     return NextResponse.json({ url });
   } catch (err) {
     console.error("[download] Failed to get download URL:", err);

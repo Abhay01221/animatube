@@ -219,18 +219,89 @@ export async function cleanupTempFiles(tmpDir: string): Promise<void> {
 /**
  * Get a download URL for a video.
  *
- * If the video has a Supabase public URL (videoUrl), return it directly.
- * Otherwise fall back to generating a presigned S3 URL from s3VideoUrl.
+ * mode "stream"   → returns the existing public/presigned URL for browser playback (unchanged behaviour)
+ * mode "download" → returns a signed URL with Content-Disposition: attachment so the browser
+ *                   always saves the file to disk instead of opening it.
+ *
+ * safeTitle sanitization is performed here, not on the frontend.
  */
 export async function getVideoDownloadUrl(
   videoUrl: string | null,
-  s3Key: string | null
+  s3Key: string | null,
+  mode: "stream" | "download" = "stream",
+  rawTitle?: string | null
 ): Promise<string> {
+  // ── safeTitle (used only in download mode) ────────────────────────────────
+  const safeTitle = (() => {
+    const base = (rawTitle ?? "video")
+      .replace(/[<>:"/\\|?*\x00-\x1f]/g, "") // remove filesystem-invalid chars
+      .replace(/\s+/g, " ")                   // collapse repeated spaces
+      .trim()
+      .replace(/ /g, "_")                     // spaces → underscores
+      .substring(0, 120);                     // max 120 chars
+    return (base || "video") + ".mp4";
+  })();
+
+  // ── STREAM mode — preserve existing behaviour exactly ────────────────────
+  if (mode === "stream") {
+    if (videoUrl) return videoUrl;
+    if (s3Key)    return getPresignedUrl(s3Key, 3600);
+    throw new Error("No video URL or S3 key available");
+  }
+
+  // ── DOWNLOAD mode ─────────────────────────────────────────────────────────
+
+  // Supabase-backed video: videoUrl is set (permanent public URL)
   if (videoUrl) {
-    return videoUrl;
+    // Derive the storage path from the public URL.
+    // Public URL format: https://<project>.supabase.co/storage/v1/object/public/<bucket>/<path>
+    // We need just the <path> portion inside the bucket.
+    const marker = "/object/public/videos/";
+    const markerIdx = videoUrl.indexOf(marker);
+    if (markerIdx === -1) {
+      // Unexpected URL format — fall back to stream URL so download still works
+      console.warn("[Storage] Could not parse Supabase path from videoUrl, falling back to public URL");
+      return videoUrl;
+    }
+    const storagePath = videoUrl.slice(markerIdx + marker.length);
+
+    const { data, error } = await supabaseAdmin.storage
+      .from(SUPABASE_BUCKET)
+      .createSignedUrl(storagePath, 300, {
+        download: safeTitle,  // Supabase sets Content-Disposition: attachment; filename="<safeTitle>"
+      });
+
+    if (error || !data?.signedUrl) {
+      throw new Error(`Supabase signed URL generation failed: ${error?.message ?? "no URL returned"}`);
+    }
+
+    return data.signedUrl;
   }
+
+  // Legacy S3-backed video: s3Key is set
   if (s3Key) {
-    return getPresignedUrl(s3Key, 3600);
+    // Import S3 presigner inline to avoid circular deps
+    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const { getSignedUrl } = await import("@aws-sdk/s3-request-presigner");
+
+    const s3 = new S3Client({
+      region: process.env.AWS_REGION ?? "us-east-1",
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+      },
+    });
+
+    return getSignedUrl(
+      s3,
+      new GetObjectCommand({
+        Bucket: process.env.AWS_S3_BUCKET!,
+        Key: s3Key,
+        ResponseContentDisposition: `attachment; filename="${safeTitle}"`,
+      }),
+      { expiresIn: 300 }
+    );
   }
+
   throw new Error("No video URL or S3 key available");
 }
