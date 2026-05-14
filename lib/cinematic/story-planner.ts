@@ -6,7 +6,7 @@
 import Groq from "groq-sdk";
 import type { StoryPlan, ScenePlan, StoryArc } from "../types/cinematic";
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY?.trim() });
 
 export interface StoryPlannerInput {
   topic: string;

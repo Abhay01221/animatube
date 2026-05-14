@@ -8,7 +8,7 @@ import type { StoryPlan, CinematicScene, CharacterDescription } from "../types/c
 import { getEmotionalPacing } from "./story-planner";
 import { generateScenePrompt } from "./prompt-enhancer";
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY?.trim() });
 
 export interface SceneScriptOutput {
   title: string;
