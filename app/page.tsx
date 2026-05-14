@@ -44,7 +44,11 @@ export default function HomePage() {
     setLoading(true);
     try {
       // Use cached token
-      const token = await user.getIdToken(false);
+      const token = await user.getIdToken(true);
+      
+      console.log("Firebase user:", user);
+      console.log("Token:", token);
+
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: {

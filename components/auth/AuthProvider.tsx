@@ -14,6 +14,7 @@ interface AuthContextType {
 }
 
 const AuthContext = createContext<AuthContextType>({
+  
   user: null,
   loading: true,
 });
@@ -28,6 +29,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
+      console.log("🔥 Firebase auth changed:", user);
       setUser(user);
       setLoading(false);
     });
