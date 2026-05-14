@@ -1,0 +1,65 @@
+name: Deploy Worker to GCP VM
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Only trigger when worker-relevant files change
+      - 'worker-entry.ts'
+      - 'lib/worker.ts'
+      - 'lib/workers/**'
+      - 'lib/stages/**'
+      - 'lib/cinematic/**'
+      - 'lib/queue.ts'
+      - 'lib/redis.ts'
+      - 'lib/s3.ts'
+      - 'lib/storage.ts'
+      - 'lib/prisma.ts'
+      - 'lib/ffmpeg.ts'
+      - 'prisma/schema.prisma'
+      - 'ecosystem.config.js'
+      - 'package.json'
+      - 'tsconfig.json'
+  workflow_dispatch:   # Allow manual trigger from GitHub Actions UI
+
+jobs:
+  deploy:
+    name: Deploy to animatube-worker VM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy to GCP VM via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.GCP_VM_IP }}
+          username: animatube
+          key: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+          port: 22
+          script_stop: true
+          script: |
+            set -e
+            echo "=== Starting Animatube Worker Deploy ==="
+            cd /home/animatube/app
+
+            echo "--- Pulling latest code ---"
+            git fetch origin main
+            git reset --hard origin/main
+
+            echo "--- Installing dependencies ---"
+            npm ci --prefer-offline
+
+            echo "--- Generating Prisma client ---"
+            npx prisma generate
+
+            echo "--- Reloading PM2 worker (zero-downtime) ---"
+            pm2 reload animatube-worker --update-env
+
+            echo "--- Verifying worker is running ---"
+            sleep 5
+            pm2 show animatube-worker | grep -E "status|restarts|uptime"
+
+            echo "=== Deploy complete ==="
