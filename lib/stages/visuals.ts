@@ -81,7 +81,7 @@ async function fetchClipOrImage(
   tmpDir: string,
   onLog?: (msg: string) => void
 ): Promise<Omit<TimelineEntry, "start_sec" | "end_sec" | "visual_cue">> {
-  const pexelsKey = process.env.PEXELS_API_KEY;
+  const pexelsKey = process.env.PEXELS_API_KEY?.trim();
 
   if (pexelsKey) {
     try {
