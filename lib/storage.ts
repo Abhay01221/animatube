@@ -285,17 +285,17 @@ export async function getVideoDownloadUrl(
     const { getSignedUrl } = await import("@aws-sdk/s3-request-presigner");
 
     const s3 = new S3Client({
-      region: process.env.AWS_REGION ?? "us-east-1",
+      region: (process.env.AWS_REGION ?? "us-east-1").trim(),
       credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID!.trim(),
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!.trim(),
       },
     });
 
     return getSignedUrl(
       s3,
       new GetObjectCommand({
-        Bucket: process.env.AWS_S3_BUCKET!,
+        Bucket: process.env.AWS_S3_BUCKET!.trim(),
         Key: s3Key,
         ResponseContentDisposition: `attachment; filename="${safeTitle}"`,
       }),
