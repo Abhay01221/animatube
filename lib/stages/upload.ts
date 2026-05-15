@@ -1,7 +1,12 @@
 /**
  * Stage 6 — YouTube Upload
- * Downloads final_video.mp4 from S3, uploads to YouTube,
+ * Downloads final_video.mp4 from storage (Supabase or S3), uploads to YouTube,
  * generates a canvas-based thumbnail (free, no API), and stores the YouTube URL in DB.
+ *
+ * storageProvider drives how the video is fetched:
+ *   "supabase" → download via Supabase Storage (existing downloadFromS3 path via s3Key)
+ *   "s3"       → fetch from public videoUrl via HTTP
+ *   null       → legacy: use existing S3 download via finalVideoS3Key
  */
 import * as fs from "fs";
 import * as path from "path";
@@ -24,11 +29,40 @@ export async function uploadToYouTube(
   console.log(`[Stage 6] Starting YouTube upload for job ${jobId}`);
   console.log(`[Stage 6] User ID: ${userId}`);
   console.log(`[Stage 6] S3 Key: ${finalVideoS3Key}`);
-  
-  onLog?.(`Downloading final video from S3: ${finalVideoS3Key}`);
 
-  // Download final video to temp file
-  const videoBuffer = await downloadFromS3(finalVideoS3Key);
+  // ── Determine storage provider from DB ────────────────────────────────────
+  const videoRecord = await prisma.video.findUnique({
+    where: { jobId },
+    select: { storageProvider: true, videoUrl: true, s3Key: true },
+  });
+
+  const storageProvider = videoRecord?.storageProvider ?? null;
+  const videoUrl = videoRecord?.videoUrl ?? null;
+  const s3KeyFromDb = videoRecord?.s3Key ?? null;
+
+  console.log(`[Stage 6] storageProvider=${storageProvider ?? "null (legacy)"}`);
+
+  let videoBuffer: Buffer;
+
+  if (storageProvider === "s3" && videoUrl) {
+    // ── Fetch from public S3 URL via HTTP ─────────────────────────────────
+    onLog?.(`Downloading final video from S3 (public URL): ${videoUrl}`);
+    console.log(`[Stage 6] Fetching video from public S3 URL: ${videoUrl}`);
+
+    const response = await fetch(videoUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch video from S3 URL: ${response.status} ${response.statusText}`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    videoBuffer = Buffer.from(arrayBuffer);
+  } else {
+    // ── Download from S3 key (Supabase intermediate key or legacy S3 key) ──
+    const keyToUse = finalVideoS3Key;
+    onLog?.(`Downloading final video from S3 key: ${keyToUse}`);
+    console.log(`[Stage 6] Downloading from S3 key: ${keyToUse}`);
+    videoBuffer = await downloadFromS3(keyToUse);
+  }
+
   const videoPath = path.join(tmpDir, "final_video.mp4");
   fs.writeFileSync(videoPath, videoBuffer);
   const videoSizeMB = (videoBuffer.length / 1024 / 1024).toFixed(1);

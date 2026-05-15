@@ -1,40 +1,68 @@
 /**
  * Persistent Video Storage Manager
  *
- * Uploads the final rendered .mp4 to Supabase Storage (bucket: "videos"),
- * stores the public URL in Prisma, then deletes the local temp file.
+ * Upload strategy for final_video.mp4:
+ *   1. Try Supabase Storage first (bucket: "videos")
+ *   2. If Supabase rejects with a size-limit error (413 / "exceeded maximum allowed size" /
+ *      "too large"), automatically fall back to AWS S3 with a public URL.
+ *   3. Any other Supabase error is re-thrown immediately (no fallback).
+ *   4. If S3 fallback also fails, re-throw — never mark a video complete without a valid URL.
  *
- * Intermediate assets (voice, raw video, subtitles) continue to use S3.
- * Thumbnail generation is unchanged.
+ * storageProvider field in DB:
+ *   "supabase" — video lives in Supabase Storage, videoUrl is the public Supabase URL
+ *   "s3"       — video lives in S3, videoUrl is the public S3 URL, s3Key holds the object key
+ *   null       — legacy row, fall back to existing videoUrl behaviour
+ *
+ * Temp-file cleanup follows this strict sequence:
+ *   1. Upload completes (Supabase or S3)
+ *   2. DB write completes (storageProvider + videoUrl + s3Key all written)
+ *   3. Only then: delete the local .mp4
+ *   4. Log "[Cleanup] Removed local render artifacts for job <jobId>"
+ *   On any failure: skip cleanup, log "[Cleanup] Skipped cleanup for job <jobId> — ..."
  */
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as path from "path";
 import { supabaseAdmin } from "./supabase";
-import { uploadFileToS3, getPresignedUrl } from "./s3";
+import { uploadFileToS3, uploadToS3, getPresignedUrl, s3Url } from "./s3";
 import { prisma } from "./prisma";
 
 const SUPABASE_BUCKET = "videos";
 
 export interface FinalVideoAssets {
-  videoS3Key: string;   // kept for backward-compat (set to Supabase path)
-  videoUrl: string;     // permanent public URL from Supabase
+  videoS3Key: string;       // backward-compat: Supabase bucket path OR S3 key
+  videoUrl: string;         // permanent public URL (Supabase or S3)
+  storageProvider: "supabase" | "s3";
   thumbnailS3Key?: string;
   thumbnailUrl?: string;
   subtitleS3Key?: string;
   subtitleUrl?: string;
 }
 
+// ─── Size-limit error detection ───────────────────────────────────────────────
+
+function isSupabaseSizeLimitError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = (
+    (err as any)?.message ??
+    (err as any)?.error?.message ??
+    String(err)
+  ).toLowerCase();
+  const status = (err as any)?.status ?? (err as any)?.statusCode ?? 0;
+  return (
+    status === 413 ||
+    msg.includes("exceeded maximum allowed size") ||
+    msg.includes("too large") ||
+    msg.includes("payload too large") ||
+    msg.includes("entity too large")
+  );
+}
+
+// ─── Main upload function ─────────────────────────────────────────────────────
+
 /**
- * Upload final video to Supabase Storage and persist the public URL in Prisma.
- *
- * Called after subtitle burn-in completes (Stage 5).
- * The local .mp4 is deleted after a successful upload.
- *
- * @param jobId         - Job identifier
- * @param finalVideoPath - Absolute path to the rendered final_video.mp4
- * @param tmpDir        - Temp directory (used for thumbnail / subtitle lookup)
- * @returns Permanent Supabase URL and optional thumbnail/subtitle assets
+ * Upload final video to persistent storage (Supabase first, S3 fallback).
+ * Cleanup only runs after both upload AND DB write succeed.
  */
 export async function uploadFinalVideoToStorage(
   jobId: string,
@@ -56,7 +84,8 @@ export async function uploadFinalVideoToStorage(
   }
 
   const stats = fs.statSync(finalVideoPath);
-  console.log(`[Storage] File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+  const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
+  console.log(`[Storage] File size: ${sizeMB} MB`);
 
   // ── 2. Read the file into a Buffer ────────────────────────────────────────
   let fileBuffer: Buffer;
@@ -72,19 +101,91 @@ export async function uploadFinalVideoToStorage(
     throw new Error(msg);
   }
 
-  // ── 3. Upload to Supabase Storage ─────────────────────────────────────────
+  // ── 3. Try Supabase Storage ───────────────────────────────────────────────
   const bucketPath = `videos/${jobId}.mp4`;
+  let storageProvider: "supabase" | "s3";
+  let videoUrl: string;
+  let finalS3Key: string | null = null;
+  let fallbackTriggered = false;
+  let fallbackReason = "";
 
-  const { error: uploadError } = await supabaseAdmin.storage
+  console.log(`[Storage] Provider: supabase (attempting)`);
+  console.log(`[Storage] File size: ${sizeMB} MB`);
+
+  const { error: supabaseError } = await supabaseAdmin.storage
     .from(SUPABASE_BUCKET)
     .upload(bucketPath, fileBuffer, {
       contentType: "video/mp4",
-      upsert: true, // overwrite if a retry re-runs the same jobId
+      upsert: true,
     });
 
-  if (uploadError) {
-    const msg = `Supabase upload failed: ${uploadError.message}`;
+  if (!supabaseError) {
+    // ── Supabase success ──────────────────────────────────────────────────
+    const { data: publicUrlData } = supabaseAdmin.storage
+      .from(SUPABASE_BUCKET)
+      .getPublicUrl(bucketPath);
+
+    storageProvider = "supabase";
+    videoUrl = publicUrlData.publicUrl;
+    console.log(`[Storage] Provider: supabase`);
+    console.log(`[Storage] Fallback triggered: no`);
+    console.log(`[Storage] Final URL: ${videoUrl}`);
+    console.log(`[Storage] Uploaded to Supabase | size: ${sizeMB} MB | url: ${videoUrl}`);
+  } else if (isSupabaseSizeLimitError(supabaseError)) {
+    // ── Size-limit error → fall back to S3 ───────────────────────────────
+    fallbackTriggered = true;
+    fallbackReason = supabaseError.message;
+    console.warn(`[Storage] Supabase rejected (size limit) | falling back to S3 | size: ${sizeMB} MB | reason: ${fallbackReason}`);
+    console.log(`[Storage] Fallback triggered: yes`);
+    console.log(`[Storage] Fallback reason: ${fallbackReason}`);
+
+    const s3ObjectKey = `videos/${jobId}/final.mp4`;
+
+    try {
+      const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
+      const region = (process.env.AWS_REGION ?? "us-east-1").trim();
+      const bucket = process.env.AWS_S3_BUCKET!.trim();
+      const s3 = new S3Client({
+        region,
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID!.trim(),
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!.trim(),
+        },
+      });
+
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: s3ObjectKey,
+          Body: fileBuffer,
+          ContentType: "video/mp4",
+          CacheControl: "public, max-age=31536000",
+          // ACL not set here — bucket policy must allow public read
+        })
+      );
+
+      const publicS3Url = s3Url(s3ObjectKey);
+      storageProvider = "s3";
+      videoUrl = publicS3Url;
+      finalS3Key = s3ObjectKey;
+
+      console.log(`[Storage] Provider: s3`);
+      console.log(`[Storage] Fallback triggered: yes`);
+      console.log(`[Storage] Fallback reason: ${fallbackReason}`);
+      console.log(`[Storage] Final URL: ${videoUrl}`);
+      console.log(`[Storage] Supabase rejected (size limit) | falling back to S3 | size: ${sizeMB} MB | s3Key: ${s3ObjectKey} | url: ${videoUrl}`);
+    } catch (s3Err) {
+      const s3ErrMsg = (s3Err as Error).message;
+      console.error(`[Storage] S3 fallback also failed | reason: ${s3ErrMsg}`);
+      console.log(`[Cleanup] Skipped cleanup for job ${jobId} — upload or DB update failed`);
+      // Do NOT mark video complete, do NOT clean up temp files
+      throw s3Err;
+    }
+  } else {
+    // ── Other Supabase error — re-throw, no fallback ──────────────────────
+    const msg = `Supabase upload failed: ${supabaseError.message}`;
     console.error(`[Storage] ${msg}`);
+    console.log(`[Cleanup] Skipped cleanup for job ${jobId} — upload or DB update failed`);
     await prisma.video.update({
       where: { jobId },
       data: { status: "failed", renderStatus: "failed", renderError: msg },
@@ -92,29 +193,35 @@ export async function uploadFinalVideoToStorage(
     throw new Error(msg);
   }
 
-  console.log(`[Storage] ✓ Video uploaded to Supabase: ${bucketPath}`);
-
-  // ── 4. Get the public URL ─────────────────────────────────────────────────
-  const { data: publicUrlData } = supabaseAdmin.storage
-    .from(SUPABASE_BUCKET)
-    .getPublicUrl(bucketPath);
-
-  const videoUrl = publicUrlData.publicUrl;
-  console.log(`[Storage] ✓ Public URL: ${videoUrl}`);
-
-  // ── 5. Delete local .mp4 after successful upload ──────────────────────────
+  // ── 4. DB write (must complete before cleanup) ────────────────────────────
   try {
-    await fsp.unlink(finalVideoPath);
-    console.log(`[Storage] ✓ Local file deleted: ${finalVideoPath}`);
-  } catch (cleanupErr) {
-    // Non-fatal — job is still completed
-    console.warn(
-      `[Storage] Warning: failed to delete local file ${finalVideoPath}:`,
-      (cleanupErr as Error).message
-    );
+    await prisma.video.update({
+      where: { jobId },
+      data: {
+        videoUrl,
+        storageProvider,
+        s3Key: finalS3Key ?? null,
+        // Keep s3VideoUrl for backward-compat (stores bucket path or S3 key)
+        s3VideoUrl: storageProvider === "supabase" ? bucketPath : (finalS3Key ?? null),
+      },
+    });
+    console.log(`[Storage] ✓ Database updated | provider: ${storageProvider}`);
+  } catch (dbErr) {
+    console.error(`[Storage] DB update failed: ${(dbErr as Error).message}`);
+    console.log(`[Cleanup] Skipped cleanup for job ${jobId} — upload or DB update failed`);
+    throw dbErr;
   }
 
-  // ── 6. Optional: upload subtitle file to S3 (unchanged) ──────────────────
+  // ── 5. Cleanup — only after upload AND DB write both succeeded ────────────
+  try {
+    await fsp.unlink(finalVideoPath);
+    console.log(`[Cleanup] Removed local render artifacts for job ${jobId}`);
+  } catch (cleanupErr) {
+    // Non-fatal — job is still complete
+    console.warn(`[Storage] Warning: failed to delete local file ${finalVideoPath}: ${(cleanupErr as Error).message}`);
+  }
+
+  // ── 6. Optional: upload subtitle file to S3 ───────────────────────────────
   let subtitleS3Key: string | undefined;
   let subtitleUrl: string | undefined;
   const subtitlePath = path.join(tmpDir, "cinematic_subs.ass");
@@ -129,11 +236,9 @@ export async function uploadFinalVideoToStorage(
     }
   }
 
-  // ── 7. Optional: generate and upload thumbnail (unchanged) ───────────────
+  // ── 7. Optional: generate and upload thumbnail ────────────────────────────
   let thumbnailS3Key: string | undefined;
   let thumbnailUrl: string | undefined;
-  // Note: finalVideoPath was deleted above; generate thumbnail from tmpDir copy
-  // if it still exists (subtitle stage may have left a copy), otherwise skip.
   const rawVideoPath = path.join(tmpDir, "raw_video.mp4");
   const thumbSourcePath = fs.existsSync(rawVideoPath) ? rawVideoPath : null;
   if (thumbSourcePath) {
@@ -150,21 +255,18 @@ export async function uploadFinalVideoToStorage(
     }
   }
 
-  // ── 8. Persist videoUrl + thumbnailUrl in Prisma ─────────────────────────
-  await prisma.video.update({
-    where: { jobId },
-    data: {
-      videoUrl,
-      s3VideoUrl: bucketPath, // store Supabase path in s3VideoUrl for compat
-      thumbnailUrl: thumbnailUrl ?? null,
-    },
-  });
-
-  console.log(`[Storage] ✓ Database updated with Supabase URL`);
+  // ── 8. Persist thumbnail in Prisma (videoUrl already written above) ───────
+  if (thumbnailUrl) {
+    await prisma.video.update({
+      where: { jobId },
+      data: { thumbnailUrl },
+    });
+  }
 
   return {
-    videoS3Key: bucketPath,
+    videoS3Key: storageProvider === "supabase" ? bucketPath : (finalS3Key ?? bucketPath),
     videoUrl,
+    storageProvider,
     thumbnailS3Key,
     thumbnailUrl,
     subtitleS3Key,
@@ -172,9 +274,8 @@ export async function uploadFinalVideoToStorage(
   };
 }
 
-/**
- * Generate a thumbnail JPEG from a video file (first frame at 1 second).
- */
+// ─── Thumbnail helper ─────────────────────────────────────────────────────────
+
 async function generateThumbnail(
   videoPath: string,
   tmpDir: string
@@ -200,9 +301,11 @@ async function generateThumbnail(
   });
 }
 
+// ─── Temp directory cleanup ───────────────────────────────────────────────────
+
 /**
  * Clean up the entire temp directory after job completion.
- * Failure is non-fatal — logs a warning only.
+ * Called from worker.ts in the `finally` block — failure is non-fatal.
  */
 export async function cleanupTempFiles(tmpDir: string): Promise<void> {
   try {
@@ -216,92 +319,146 @@ export async function cleanupTempFiles(tmpDir: string): Promise<void> {
   }
 }
 
+// ─── Download URL helper ──────────────────────────────────────────────────────
+
 /**
- * Get a download URL for a video.
+ * Get a URL for video download or streaming.
  *
- * mode "stream"   → returns the existing public/presigned URL for browser playback (unchanged behaviour)
- * mode "download" → returns a signed URL with Content-Disposition: attachment so the browser
- *                   always saves the file to disk instead of opening it.
+ * storageProvider drives the logic:
+ *   "supabase" → Supabase signed URL (download mode) or public URL (stream mode)
+ *   "s3"       → public S3 URL (no expiry needed — bucket is public)
+ *   null       → legacy: use videoUrl or s3Key as before
  *
- * safeTitle sanitization is performed here, not on the frontend.
+ * mode "stream"   → URL for browser playback (no Content-Disposition)
+ * mode "download" → URL that forces browser save-to-disk
  */
 export async function getVideoDownloadUrl(
   videoUrl: string | null,
   s3Key: string | null,
   mode: "stream" | "download" = "stream",
-  rawTitle?: string | null
+  rawTitle?: string | null,
+  storageProvider?: string | null
 ): Promise<string> {
-  // ── safeTitle (used only in download mode) ────────────────────────────────
+  // ── safeTitle (download mode only) ───────────────────────────────────────
   const safeTitle = (() => {
     const base = (rawTitle ?? "video")
-      .replace(/[<>:"/\\|?*\x00-\x1f]/g, "") // remove filesystem-invalid chars
-      .replace(/\s+/g, " ")                   // collapse repeated spaces
+      .replace(/[<>:"/\\|?*\x00-\x1f]/g, "")
+      .replace(/\s+/g, " ")
       .trim()
-      .replace(/ /g, "_")                     // spaces → underscores
-      .substring(0, 120);                     // max 120 chars
+      .replace(/ /g, "_")
+      .substring(0, 120);
     return (base || "video") + ".mp4";
   })();
 
-  // ── STREAM mode — preserve existing behaviour exactly ────────────────────
-  if (mode === "stream") {
-    if (videoUrl) return videoUrl;
-    if (s3Key)    return getPresignedUrl(s3Key, 3600);
-    throw new Error("No video URL or S3 key available");
+  console.log(`[Storage/download] storageProvider=${storageProvider ?? "null"}`);
+  console.log(`[Storage/download] videoUrl=${videoUrl ?? "null"}`);
+  console.log(`[Storage/download] s3Key=${s3Key ?? "null"}`);
+  console.log(`[Storage/download] mode=${mode}`);
+
+  // ── S3-backed video (new storageProvider="s3") ────────────────────────────
+  if (storageProvider === "s3") {
+    if (!videoUrl) throw new Error("storageProvider is s3 but videoUrl is null");
+    // videoUrl is the permanent public S3 URL — no signing needed
+    console.log(`[Storage/download] Provider: s3 | returning public URL`);
+    console.log(`[Storage/download] Final URL: ${videoUrl}`);
+    return videoUrl;
   }
 
-  // ── DOWNLOAD mode ─────────────────────────────────────────────────────────
+  // ── Supabase-backed video (storageProvider="supabase" or legacy with videoUrl) ──
+  if (storageProvider === "supabase" || (storageProvider == null && videoUrl)) {
+    if (!videoUrl) throw new Error("storageProvider is supabase but videoUrl is null");
 
-  // Supabase-backed video: videoUrl is set (permanent public URL)
-  if (videoUrl) {
-    // Derive the storage path from the public URL.
-    // Public URL format: https://<project>.supabase.co/storage/v1/object/public/<bucket>/<path>
-    // We need just the <path> portion inside the bucket.
-    const marker = "/object/public/videos/";
-    const markerIdx = videoUrl.indexOf(marker);
-    if (markerIdx === -1) {
-      // Unexpected URL format — fall back to stream URL so download still works
-      console.warn("[Storage] Could not parse Supabase path from videoUrl, falling back to public URL");
+    console.log(`[Storage/download] Provider: supabase`);
+    console.log(`[Storage/download] NEXT_PUBLIC_SUPABASE_URL set: ${!!process.env.NEXT_PUBLIC_SUPABASE_URL}`);
+    console.log(`[Storage/download] SUPABASE_SERVICE_ROLE_KEY set: ${!!process.env.SUPABASE_SERVICE_ROLE_KEY}`);
+
+    if (mode === "stream") {
+      console.log(`[Storage/download] Final URL: ${videoUrl}`);
       return videoUrl;
     }
-    const storagePath = videoUrl.slice(markerIdx + marker.length);
 
-    const { data, error } = await supabaseAdmin.storage
-      .from(SUPABASE_BUCKET)
-      .createSignedUrl(storagePath, 300, {
-        download: safeTitle,  // Supabase sets Content-Disposition: attachment; filename="<safeTitle>"
-      });
-
-    if (error || !data?.signedUrl) {
-      throw new Error(`Supabase signed URL generation failed: ${error?.message ?? "no URL returned"}`);
+    // Download mode: create a Supabase signed URL with Content-Disposition
+    // Resolve the bucket path: prefer s3Key (raw path) over parsing the public URL
+    let storagePath: string | null = null;
+    if (s3Key && !s3Key.startsWith("http")) {
+      storagePath = s3Key;
+      console.log(`[Storage/download] Using s3Key as Supabase bucket path: ${storagePath}`);
+    } else {
+      const marker = "/object/public/videos/";
+      const idx = videoUrl.indexOf(marker);
+      if (idx !== -1) {
+        storagePath = videoUrl.slice(idx + marker.length);
+        console.log(`[Storage/download] Parsed Supabase path from videoUrl: ${storagePath}`);
+      }
     }
 
-    return data.signedUrl;
+    if (!storagePath) {
+      console.warn("[Storage/download] Could not determine Supabase storage path, falling back to public URL");
+      return videoUrl;
+    }
+
+    try {
+      const { data, error } = await supabaseAdmin.storage
+        .from(SUPABASE_BUCKET)
+        .createSignedUrl(storagePath, 300, { download: safeTitle });
+
+      if (error || !data?.signedUrl) {
+        console.error(`[Storage/download] Supabase signed URL failed: ${error?.message ?? "no URL returned"}`);
+        console.warn(`[Storage/download] Falling back to public URL`);
+        return videoUrl;
+      }
+
+      console.log(`[Storage/download] ✓ Supabase signed URL generated`);
+      console.log(`[Storage/download] Final URL: (signed)`);
+      return data.signedUrl;
+    } catch (err) {
+      console.error(`[Storage/download] Supabase signed URL threw:`, err);
+      console.warn(`[Storage/download] Falling back to public URL`);
+      return videoUrl;
+    }
   }
 
-  // Legacy S3-backed video: s3Key is set
+  // ── Legacy S3-backed video (storageProvider=null, no videoUrl, s3Key set) ──
   if (s3Key) {
-    // Import S3 presigner inline to avoid circular deps
+    console.log(`[Storage/download] Legacy S3 path. Bucket: ${process.env.AWS_S3_BUCKET}, Region: ${process.env.AWS_REGION}, Key: ${s3Key}`);
+    console.log(`[Storage/download] AWS_ACCESS_KEY_ID set: ${!!process.env.AWS_ACCESS_KEY_ID}`);
+    console.log(`[Storage/download] AWS_SECRET_ACCESS_KEY set: ${!!process.env.AWS_SECRET_ACCESS_KEY}`);
+
     const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
     const { getSignedUrl } = await import("@aws-sdk/s3-request-presigner");
 
-    const s3 = new S3Client({
-      region: (process.env.AWS_REGION ?? "us-east-1").trim(),
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID!.trim(),
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!.trim(),
-      },
-    });
+    const region = (process.env.AWS_REGION ?? "us-east-1").trim();
+    const bucket = process.env.AWS_S3_BUCKET?.trim();
+    const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
+    const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
 
-    return getSignedUrl(
-      s3,
-      new GetObjectCommand({
-        Bucket: process.env.AWS_S3_BUCKET!.trim(),
-        Key: s3Key,
-        ResponseContentDisposition: `attachment; filename="${safeTitle}"`,
-      }),
-      { expiresIn: 300 }
-    );
+    if (!bucket || !accessKeyId || !secretAccessKey) {
+      throw new Error(
+        `Missing AWS credentials for S3 download. Bucket: ${bucket ? "set" : "MISSING"}, ` +
+        `AccessKeyId: ${accessKeyId ? "set" : "MISSING"}, SecretKey: ${secretAccessKey ? "set" : "MISSING"}`
+      );
+    }
+
+    const s3 = new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
+
+    try {
+      const signedUrl = await getSignedUrl(
+        s3,
+        new GetObjectCommand({
+          Bucket: bucket,
+          Key: s3Key,
+          ResponseContentDisposition: `attachment; filename="${safeTitle}"`,
+        }),
+        { expiresIn: 300 }
+      );
+      console.log(`[Storage/download] ✓ Legacy S3 signed URL generated for key: ${s3Key}`);
+      console.log(`[Storage/download] Final URL: (signed)`);
+      return signedUrl;
+    } catch (err) {
+      console.error(`[Storage/download] S3 getSignedUrl failed. Bucket: ${bucket}, Region: ${region}, Key: ${s3Key}`, err);
+      throw err;
+    }
   }
 
-  throw new Error("No video URL or S3 key available");
+  throw new Error("Video URL not available");
 }

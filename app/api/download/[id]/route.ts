@@ -2,9 +2,10 @@
  * GET /api/download/[id]
  * Returns a download URL for the final MP4.
  *
- * Priority:
- *   1. video.videoUrl  — permanent Supabase Storage public URL (new)
- *   2. video.s3VideoUrl — presigned S3 URL (legacy fallback)
+ * storageProvider drives the URL strategy:
+ *   "supabase" → Supabase signed URL with Content-Disposition: attachment
+ *   "s3"       → public S3 URL (no expiry)
+ *   null       → legacy: fall back to videoUrl / s3VideoUrl behaviour
  */
 import { NextRequest, NextResponse } from "next/server";
 import { verifyIdToken } from "@/lib/firebase-admin";
@@ -50,20 +51,32 @@ export async function GET(
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
+  console.log(`[download] Video record found. id=${id}`);
+  console.log(`[download] storageProvider=${video.storageProvider ?? "null"}`);
+  console.log(`[download] videoUrl=${video.videoUrl ?? "null"}`);
+  console.log(`[download] s3Key=${video.s3Key ?? "null"}`);
+  console.log(`[download] s3VideoUrl=${video.s3VideoUrl ?? "null"}`);
+  console.log(`[download] status=${video.status}, renderStatus=${video.renderStatus}`);
+
   if (!video.videoUrl && !video.s3VideoUrl) {
-    return NextResponse.json({ error: "Video not ready" }, { status: 400 });
+    return NextResponse.json({ error: "Video URL not available" }, { status: 404 });
   }
 
   try {
     const url = await getVideoDownloadUrl(
       video.videoUrl ?? null,
-      video.s3VideoUrl ?? null,
+      // For s3 provider use s3Key; for supabase/legacy use s3VideoUrl (bucket path)
+      video.storageProvider === "s3" ? (video.s3Key ?? null) : (video.s3VideoUrl ?? null),
       "download",
-      video.title ?? null
+      video.title ?? null,
+      video.storageProvider ?? null
     );
     return NextResponse.json({ url });
   } catch (err) {
     console.error("[download] Failed to get download URL:", err);
-    return NextResponse.json({ error: "Failed to generate download URL" }, { status: 500 });
+    return NextResponse.json(
+      { error: "Failed to generate download URL", detail: (err as Error).message },
+      { status: 500 }
+    );
   }
 }

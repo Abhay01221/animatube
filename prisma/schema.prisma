@@ -117,7 +117,12 @@ model Video {
   s3RawVideoUrl String? // raw_video.mp4 (before subtitles)
 
   // Supabase Storage public URL for the final rendered video
-  videoUrl      String? // permanent public URL (Supabase Storage)
+  videoUrl      String? // permanent public URL (Supabase or S3)
+
+  // Storage provider for the final video ("supabase" | "s3" | null for legacy rows)
+  storageProvider String?
+  // S3 object key — only populated when storageProvider = "s3"
+  s3Key           String?
 
   // YouTube upload (completely optional)
   youtubeId    String?

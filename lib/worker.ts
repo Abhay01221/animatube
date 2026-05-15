@@ -230,25 +230,23 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
     await stageDone(jobId, 5);
 
     // ── CRITICAL: Upload final video to permanent storage ────────────────────
+    // uploadFinalVideoToStorage handles its own DB write (storageProvider, videoUrl, s3Key,
+    // s3VideoUrl, thumbnailUrl). It also handles cleanup after the DB write succeeds.
     console.log(`[Storage] Uploading final video to permanent storage`);
     const finalVideoPath = path.join(tmpDir, "final_video.mp4");
-    const { videoS3Key: permanentS3Key, videoUrl, thumbnailUrl } = await uploadFinalVideoToStorage(
-      jobId,
-      finalVideoPath,
-      tmpDir
-    );
-    
-    // Update database with permanent storage URLs
+    const { videoS3Key: permanentS3Key, videoUrl, thumbnailUrl, storageProvider } =
+      await uploadFinalVideoToStorage(jobId, finalVideoPath, tmpDir);
+
+    // Mark render complete (storage function already wrote videoUrl/s3Key/storageProvider)
     await prisma.video.update({
       where: { jobId },
-      data: { 
-        s3VideoUrl: permanentS3Key,
-        thumbnailUrl: thumbnailUrl || null,
+      data: {
         renderStatus: "completed",
+        thumbnailUrl: thumbnailUrl || null,
       },
     });
-    
-    console.log(`[Storage] ✓ Final video permanently stored: ${permanentS3Key}`);
+
+    console.log(`[Storage] ✓ Final video permanently stored: ${permanentS3Key} (provider: ${storageProvider})`);
     console.log(`[Storage] ✓ Video URL: ${videoUrl}`);
 
     // ── Stage 6: YouTube Upload ──────────────────────────────────────────────
