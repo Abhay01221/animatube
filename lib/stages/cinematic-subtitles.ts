@@ -338,13 +338,17 @@ function burnCinematicSubtitles(
         "-c:v",
         "libx264",
         "-preset",
-        "fast",
+        "veryfast",             // was: fast — saves additional RAM
         "-crf",
         "22",
         "-c:a",
         "copy",
         "-pix_fmt",
         "yuv420p",
+        "-threads",
+        "2",                    // limit CPU/RAM usage
+        "-max_muxing_queue_size",
+        "512",
       ])
       .output(outputPath)
       .on("start", (cmd) => {
