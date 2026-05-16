@@ -82,9 +82,9 @@ EOF
 systemctl enable fail2ban
 systemctl restart fail2ban
 
-# ── 6. Node.js 20 ─────────────────────────────────────────────────────────────
-echo "[6/10] Installing Node.js 20..."
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+# ── 6. Node.js 22 ─────────────────────────────────────────────────────────────
+echo "[6/10] Installing Node.js 22..."
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y nodejs
 node --version
 npm --version

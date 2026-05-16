@@ -45,6 +45,18 @@ jobs:
             echo "=== Starting Animatube Worker Deploy ==="
             cd /home/animatube/app
 
+            echo "--- Checking Node.js version ---"
+            node --version
+            NODE_MAJOR=$(node -e "process.stdout.write(process.version.split('.')[0].replace('v',''))")
+            if [ "$NODE_MAJOR" -lt "22" ]; then
+              echo "--- Upgrading Node.js to v22 (current: $(node --version)) ---"
+              curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
+              sudo apt-get install -y nodejs
+              echo "--- Node.js upgraded to: $(node --version) ---"
+            else
+              echo "--- Node.js $(node --version) is already v22+ ---"
+            fi
+
             echo "--- Pulling latest code ---"
             git fetch origin main
             git reset --hard origin/main

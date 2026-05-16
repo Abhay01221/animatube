@@ -27,6 +27,7 @@ export async function generateVoiceover(
   // Concatenate all segments into one narration text
   const fullText = segments.map((s) => s.segment).join(" ");
   onLog?.(`Generating voiceover (${fullText.length} chars) with voice "${voiceId}"`);
+  console.log(`[Voice] Runtime Node version: ${process.version}`);
 
   // Create temp directory for audio file
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `animatube-${jobId}-`));

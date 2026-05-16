@@ -14,6 +14,7 @@ import { createWorker } from "./lib/worker";
 console.log("========================================");
 console.log("🚀 Animatube Worker Starting");
 console.log("========================================");
+console.log(`Node.js version: ${process.version}`);
 console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
 console.log(`Redis URL: ${process.env.REDIS_URL?.replace(/:\/\/.*@/, "://<credentials>@")}`);
 console.log(`Database: ${process.env.DATABASE_URL?.split("@")[1] || "not configured"}`);

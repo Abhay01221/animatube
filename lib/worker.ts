@@ -204,30 +204,85 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
     // ── Stage 5: Cinematic Subtitles ─────────────────────────────────────────
     console.log(`[Stage 5] Starting cinematic subtitle burn-in for job ${jobId}`);
     console.log(`[Stage 5] Raw video S3 Key: ${rawVideoS3Key}`);
+    console.log(`[Stage 5] Subtitle runtime Node version: ${process.version}`);
     await stageActive(jobId, 5, "Burning cinematic subtitles into video");
-    
-    const finalVideoS3Key = await addCinematicSubtitles(
-      jobId,
-      cinematicScript.scenes,
-      timeline,
-      rawVideoS3Key,
-      tmpDir,
-      {
-        fontSize: 18,
-        maxCharsPerLine: 42,
-        maxLines: 2,
-        fadeInDuration: 0.2,
-        fadeOutDuration: 0.2,
-      },
-      (log) => publishProgress(jobId, { stage: 5, name: STAGE_NAMES[4], status: "active", log })
-    );
-    
-    await prisma.video.update({
-      where: { jobId },
-      data: { s3VideoUrl: finalVideoS3Key },
-    });
-    console.log(`[Stage 5] Success - Final cinematic video S3 Key: ${finalVideoS3Key}`);
-    await stageDone(jobId, 5);
+
+    let finalVideoS3Key: string;
+    let subtitlesFailed = false;
+
+    try {
+      finalVideoS3Key = await addCinematicSubtitles(
+        jobId,
+        cinematicScript.scenes,
+        timeline,
+        rawVideoS3Key,
+        tmpDir,
+        {
+          fontSize: 18,
+          maxCharsPerLine: 42,
+          maxLines: 2,
+          fadeInDuration: 0.2,
+          fadeOutDuration: 0.2,
+        },
+        (log) => publishProgress(jobId, { stage: 5, name: STAGE_NAMES[4], status: "active", log })
+      );
+
+      await prisma.video.update({
+        where: { jobId },
+        data: { s3VideoUrl: finalVideoS3Key, subtitlesAdded: true },
+      });
+      console.log(`[Stage 5] Success - Final cinematic video S3 Key: ${finalVideoS3Key}`);
+      await stageDone(jobId, 5);
+    } catch (subtitleErr) {
+      // Subtitle failure is non-fatal — fall back to raw video without subtitles
+      const subtitleError = (subtitleErr as Error).message;
+      console.error(`[Stage 5] Subtitle burn-in failed: ${subtitleError}`);
+      console.warn(`[Stage 5] Falling back to raw video without subtitles`);
+      subtitlesFailed = true;
+
+      await publishProgress(jobId, {
+        stage: 5,
+        name: STAGE_NAMES[4],
+        status: "error",
+        log: `Subtitles failed (non-fatal): ${subtitleError}. Continuing with raw video.`,
+      });
+
+      // Copy raw_video.mp4 → final_video.mp4 locally so the upload stage finds it
+      const rawVideoPath = path.join(tmpDir, "raw_video.mp4");
+      const finalVideoPath = path.join(tmpDir, "final_video.mp4");
+
+      if (fs.existsSync(rawVideoPath)) {
+        fs.copyFileSync(rawVideoPath, finalVideoPath);
+        console.log(`[Stage 5] Copied raw_video.mp4 → final_video.mp4 as subtitle fallback`);
+      } else {
+        // raw_video.mp4 was already cleaned up — re-download from S3
+        console.log(`[Stage 5] raw_video.mp4 not on disk, re-downloading from S3: ${rawVideoS3Key}`);
+        const { downloadFromS3 } = await import("./s3");
+        const rawBuffer = await downloadFromS3(rawVideoS3Key);
+        fs.writeFileSync(finalVideoPath, rawBuffer);
+        console.log(`[Stage 5] Re-downloaded raw video as subtitle fallback`);
+      }
+
+      // Use the raw video S3 key as the "final" key for the upload stage
+      finalVideoS3Key = rawVideoS3Key;
+
+      await prisma.video.update({
+        where: { jobId },
+        data: {
+          s3VideoUrl: finalVideoS3Key,
+          subtitlesAdded: false,
+          uploadError: `Subtitles failed: ${subtitleError}`,
+        },
+      });
+
+      // Mark stage 5 as done (with warning) so the pipeline continues
+      await publishProgress(jobId, {
+        stage: 5,
+        name: STAGE_NAMES[4],
+        status: "done",
+        log: "Subtitles skipped — video will render without subtitles.",
+      });
+    }
 
     // ── CRITICAL: Upload final video to permanent storage ────────────────────
     // uploadFinalVideoToStorage handles its own DB write (storageProvider, videoUrl, s3Key,
