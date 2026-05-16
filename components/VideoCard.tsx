@@ -17,15 +17,15 @@ interface VideoCardProps {
     title?: string | null;
     prompt: string;
     status: string;
-    renderStatus?: string;
-    uploadStatus?: string;
+    renderStatus?: string | null;
+    uploadStatus?: string | null;
     style: string;
     duration: string;
     youtubeUrl?: string | null;
     youtubeId?: string | null;
     s3VideoUrl?: string | null;
-    videoUrl?: string | null; // Presigned playback URL
-    downloadUrl?: string | null; // Download API endpoint
+    videoUrl?: string | null;
+    downloadUrl?: string | null;
     thumbnailUrl?: string | null;
     errorMessage?: string | null;
     renderError?: string | null;
