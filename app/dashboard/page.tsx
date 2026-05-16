@@ -19,11 +19,19 @@ interface VideoItem {
   title?: string | null;
   prompt: string;
   status: string;
+  renderStatus?: string | null;
+  uploadStatus?: string | null;
   style: string;
   duration: string;
   youtubeUrl?: string | null;
   youtubeId?: string | null;
+  storageProvider?: string | null;
   s3VideoUrl?: string | null;
+  videoUrl?: string | null;       // resolved playback URL
+  downloadUrl?: string | null;    // /api/download/[id]
+  thumbnailUrl?: string | null;
+  renderError?: string | null;
+  uploadError?: string | null;
   errorMessage?: string | null;
   createdAt: string;
 }
@@ -35,6 +43,10 @@ interface DashboardData {
     thisWeek: number;
     completed: number;
     failed: number;
+    uploaded?: number;
+    renderCompleted?: number;
+    renderFailed?: number;
+    uploadFailed?: number;
   };
 }
 
@@ -81,7 +93,15 @@ export default function DashboardPage() {
   const filtered =
     filter === "all"
       ? data?.videos ?? []
-      : (data?.videos ?? []).filter((v) => v.status === filter);
+      : (data?.videos ?? []).filter((v) => {
+          if (filter === "completed") {
+            return v.renderStatus === "completed" || v.status === "completed";
+          }
+          if (filter === "failed") {
+            return v.renderStatus === "failed" || v.status === "failed";
+          }
+          return v.status === filter;
+        });
 
   return (
     <AuthGuard>
@@ -164,7 +184,11 @@ export default function DashboardPage() {
               {f.label}
               {data && f.value !== "all" && (
                 <span className="ml-1.5 text-xs opacity-60">
-                  {data.videos.filter((v) => v.status === f.value).length}
+                  {data.videos.filter((v) => {
+                    if (f.value === "completed") return v.renderStatus === "completed" || v.status === "completed";
+                    if (f.value === "failed") return v.renderStatus === "failed" || v.status === "failed";
+                    return v.status === f.value;
+                  }).length}
                 </span>
               )}
             </button>

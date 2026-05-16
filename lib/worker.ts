@@ -241,6 +241,7 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
     await prisma.video.update({
       where: { jobId },
       data: {
+        status: "completed",       // legacy field — must be set for dashboard filter
         renderStatus: "completed",
         thumbnailUrl: thumbnailUrl || null,
       },
@@ -318,14 +319,40 @@ async function processVideoJob(job: Job<VideoJobData>): Promise<void> {
     const errorMessage = (err as Error).message;
     console.error(`[Worker] Job ${jobId} failed:`, err);
 
-    await prisma.video.update({
-      where: { jobId },
-      data: { 
-        status: "failed",
-        renderStatus: "failed",
-        renderError: errorMessage,
-      },
-    });
+    // Only mark as failed if the video was NOT already stored successfully.
+    // Check DB first — if renderStatus is already "completed", the MP4 exists
+    // in storage and we must not overwrite it with a failed status.
+    try {
+      const current = await prisma.video.findUnique({
+        where: { jobId },
+        select: { renderStatus: true, videoUrl: true },
+      });
+
+      if (current?.renderStatus === "completed" && current?.videoUrl) {
+        // Upload succeeded — only the YouTube stage or a post-upload step failed.
+        // Keep the video as completed and downloadable.
+        console.warn(`[Worker] Job ${jobId} error after successful upload — keeping completed status`);
+        console.warn(`[Worker] Error was: ${errorMessage}`);
+        await prisma.video.update({
+          where: { jobId },
+          data: {
+            uploadStatus: "failed",
+            uploadError: errorMessage,
+          },
+        });
+      } else {
+        await prisma.video.update({
+          where: { jobId },
+          data: {
+            status: "failed",
+            renderStatus: "failed",
+            renderError: errorMessage,
+          },
+        });
+      }
+    } catch (dbErr) {
+      console.error(`[Worker] Failed to update error status in DB:`, dbErr);
+    }
 
     // Determine which stage failed
     const currentStage = await getCurrentStage(jobId);

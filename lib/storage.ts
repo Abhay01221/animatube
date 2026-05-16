@@ -127,6 +127,25 @@ export async function uploadFinalVideoToStorage(
 
     storageProvider = "supabase";
     videoUrl = publicUrlData.publicUrl;
+
+    // Verify the object actually exists before trusting the URL
+    const { data: listData, error: listError } = await supabaseAdmin.storage
+      .from(SUPABASE_BUCKET)
+      .list(`videos`, { search: `${jobId}.mp4` });
+
+    if (listError) {
+      console.warn(`[Storage] Could not verify uploaded object (non-fatal): ${listError.message}`);
+    } else {
+      const found = listData?.some((f) => f.name === `${jobId}.mp4`);
+      if (found) {
+        console.log(`[Storage] Verified uploaded object exists in bucket`);
+      } else {
+        console.warn(`[Storage] Object not found in listing after upload — URL may still be valid`);
+      }
+    }
+
+    console.log(`[Storage] Final video uploaded successfully`);
+    console.log(`[Storage] Public URL generated successfully: ${videoUrl}`);
     console.log(`[Storage] Provider: supabase`);
     console.log(`[Storage] Fallback triggered: no`);
     console.log(`[Storage] Final URL: ${videoUrl}`);
@@ -194,6 +213,7 @@ export async function uploadFinalVideoToStorage(
   }
 
   // ── 4. DB write (must complete before cleanup) ────────────────────────────
+  let dbWriteSucceeded = false;
   try {
     await prisma.video.update({
       where: { jobId },
@@ -205,11 +225,32 @@ export async function uploadFinalVideoToStorage(
         s3VideoUrl: storageProvider === "supabase" ? bucketPath : (finalS3Key ?? null),
       },
     });
-    console.log(`[Storage] ✓ Database updated | provider: ${storageProvider}`);
+    dbWriteSucceeded = true;
+    console.log(`[DB] Video metadata persisted successfully | provider: ${storageProvider} | url: ${videoUrl}`);
   } catch (dbErr) {
-    console.error(`[Storage] DB update failed: ${(dbErr as Error).message}`);
-    console.log(`[Cleanup] Skipped cleanup for job ${jobId} — upload or DB update failed`);
-    throw dbErr;
+    // DB write failed — attempt one retry before giving up
+    console.error(`[Storage] DB update failed (attempt 1): ${(dbErr as Error).message}`);
+    console.warn(`[Storage] Retrying DB write...`);
+    try {
+      await new Promise((r) => setTimeout(r, 1000)); // 1s back-off
+      await prisma.video.update({
+        where: { jobId },
+        data: {
+          videoUrl,
+          storageProvider,
+          s3Key: finalS3Key ?? null,
+          s3VideoUrl: storageProvider === "supabase" ? bucketPath : (finalS3Key ?? null),
+        },
+      });
+      dbWriteSucceeded = true;
+      console.log(`[DB] Video metadata persisted successfully (retry) | provider: ${storageProvider}`);
+    } catch (retryErr) {
+      console.error(`[Storage] DB update failed (attempt 2): ${(retryErr as Error).message}`);
+      console.log(`[Cleanup] Skipped cleanup for job ${jobId} — upload or DB update failed`);
+      // Upload succeeded but DB failed — do NOT mark as failed (MP4 exists in storage)
+      // Rethrow so the worker can handle it
+      throw retryErr;
+    }
   }
 
   // ── 5. Cleanup — only after upload AND DB write both succeeded ────────────
