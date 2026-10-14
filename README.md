@@ -16,6 +16,27 @@ Both processes need database, Redis, storage and provider configuration. The wor
 
 For Windows development with Ubuntu WSL, install Ubuntu's redis-server package, then run `npm run local:redis`. This starts a password-protected loopback Redis instance on port 6380 with persistent AOF storage and adds a local REDIS_URL override without modifying cloud credentials in .env. Run it again after WSL/machine restarts. Restart web/worker processes after environment changes. Run `npm run check:runtime` to verify database and queue connectivity without generating videos.
 
+## Production setup
+
+Deploy the Next.js web app and the persistent worker as separate services. The included `vercel.json` configures the web build; `railway.toml` selects `Dockerfile.worker`, which installs FFmpeg, build tools and Noto fonts and runs `npm run worker`. Other hosts can run the same commands.
+
+1. Configure both services from `.env.production.example`, with `NODE_ENV=production`, the production `APP_URL`, and access to the same PostgreSQL, Redis and private storage.
+2. Back up the database and apply the reviewed migrations with `npm run db:deploy` before starting the updated services. Use the existing-installation procedure below when migration history is missing.
+3. Build the web service with `npm run build` and start it with `npm run start`. Start the worker independently with `npm run worker` or the supplied Docker image.
+4. Add the production host to Firebase authorized domains and configure the separate YouTube callback described below. Supply Firebase client configuration at web build time; keep admin/provider credentials on the server.
+5. Run `npm run check:runtime` and check worker logs. Verify login, storyboard approval, rendering, download and resume with a staging account before accepting production jobs.
+
+Allow enough worker CPU, memory and temporary disk for FFmpeg. Web request timeouts must accommodate downloads; durable outbox tasks let cloud deletion continue in the worker after an interrupted web request.
+
+## Code map
+
+- `app/` contains pages and authenticated API routes; `components/` contains the creation form, storyboard editor, progress, library and video player.
+- `lib/generation/` manages saved options, checkpoint validation, credits, queue intents, publishing and permanent deletion.
+- `worker-entry.ts` starts the render/upload workers and outbox recovery; `lib/workers/` implements execution and `lib/stages/` implements each render stage.
+- `lib/cinematic/` contains story planning, scene scripting, visual providers and render options; `lib/types/cinematic.ts` defines shared scene types.
+- `lib/assets.ts`, `lib/storage.ts` and `lib/s3.ts` manage private media; `lib/server-auth.ts` and `lib/firebase-admin.ts` verify app identity.
+- `prisma/` holds the schema and migrations; `scripts/` holds database/runtime utilities; `tests/` and component test files cover recovery and regressions.
+
 ## Database migrations
 
 For an existing original installation, `npm run db:setup` saves a local schema/credit snapshot, baselines the existing tables and applies the additive migrations. The Prisma CLI now follows the same environment-file precedence as the app. Supabase migrations use session port 5432; use DIRECT_URL for a dedicated migration connection when needed. A successful `npx prisma migrate status` should report that the database is up to date.
