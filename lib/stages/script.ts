@@ -1,6 +1,6 @@
 /**
  * Stage 1 — Script Generation
- * Calls Groq (llama-3.3-70b-versatile) for fast, high-quality script generation.
+ * Calls Groq for fast, high-quality script generation.
  */
 import dotenv from "dotenv";
 import path from "path";
@@ -73,7 +73,7 @@ Language: ${language}.
 IMPORTANT: Make sure the total duration of all segments adds up to exactly ${duration === "short" ? "180 seconds (3 minutes)" : "480 seconds (8 minutes)"}.`;
 
   const completion = await groq.chat.completions.create({
-    model: "llama-3.3-70b-versatile",
+    model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },

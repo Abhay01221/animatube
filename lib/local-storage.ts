@@ -6,7 +6,8 @@
  */
 import * as fs from "fs";
 import * as path from "path";
-import { downloadFromS3 } from "./s3";
+import { assetFromVideo, downloadAsset, type AssetRef } from "./assets";
+import { prisma } from "./prisma";
 
 // Local library storage path (relative to project root)
 const LIBRARY_BASE_PATH = path.join(process.cwd(), "storage", "library");
@@ -25,7 +26,7 @@ export function ensureLibraryDirectory(): void {
  * Get the local file path for a job's final video
  */
 export function getLocalFilePath(jobId: string): string {
-  const jobDir = path.join(LIBRARY_BASE_PATH, jobId);
+  const jobDir = getJobDirectory(jobId);
   return path.join(jobDir, "final.mp4");
 }
 
@@ -33,7 +34,10 @@ export function getLocalFilePath(jobId: string): string {
  * Get the local directory for a job
  */
 export function getJobDirectory(jobId: string): string {
-  return path.join(LIBRARY_BASE_PATH, jobId);
+  if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) throw new Error("Invalid job ID");
+  const directory = path.resolve(LIBRARY_BASE_PATH, jobId);
+  if (!directory.startsWith(path.resolve(LIBRARY_BASE_PATH) + path.sep)) throw new Error("Invalid library path");
+  return directory;
 }
 
 /**
@@ -45,7 +49,7 @@ export function getJobDirectory(jobId: string): string {
  */
 export async function saveFinalVideoToLibrary(
   jobId: string,
-  s3Key: string
+  s3Key: string | AssetRef
 ): Promise<string> {
   console.log(`[LocalStorage] Saving final video for job ${jobId}`);
   
@@ -60,13 +64,15 @@ export async function saveFinalVideoToLibrary(
   
   // Download from S3
   console.log(`[LocalStorage] Downloading from S3: ${s3Key}`);
-  const videoBuffer = await downloadFromS3(s3Key);
+  const video = typeof s3Key === "string" ? await prisma.video.findUnique({ where: { jobId } }) : null;
+  const asset = typeof s3Key === "string" ? (video ? assetFromVideo(video) : null) : s3Key;
+  if (!asset) throw new Error("Durable video asset reference unavailable");
   
   // Save to local file
   const localPath = getLocalFilePath(jobId);
-  fs.writeFileSync(localPath, videoBuffer);
+  await downloadAsset(asset, localPath);
   
-  const fileSizeMB = (videoBuffer.length / 1024 / 1024).toFixed(2);
+  const fileSizeMB = (fs.statSync(localPath).size / 1024 / 1024).toFixed(2);
   console.log(`[LocalStorage] Saved to: ${localPath} (${fileSizeMB} MB)`);
   
   return localPath;

@@ -1,330 +1,135 @@
-/**
- * Stage 4 (Enhanced) — Cinematic Video Assembly
- *
- * Memory-safe for 8GB RAM (GCP e2-standard-2):
- * - Per-scene renders output 720p (motion-effects.ts handles this)
- * - Concatenation upscales 720p → 1080p in a single pass (no double-encode)
- * - All FFmpeg processes limited to 2 threads
- * - Temp scene files deleted immediately after each scene is added to concat list
- * - Retry logic: each scene retries once on failure before aborting
- * - loudnorm removed from audio mix (CPU-intensive, not needed for stability)
- */
+/** Native-size scene assembly with independent render checkpoints. */
 import * as fs from "fs";
 import * as path from "path";
-import ffmpeg from "../ffmpeg";
+import { createHash } from "crypto";
+import ffmpeg, { runFFmpeg } from "../ffmpeg";
 import { downloadFromS3, uploadFileToS3 } from "../s3";
-import {
-  applyMotionEffectsToImage,
-  applyMotionEffectsToClip,
-} from "../cinematic/motion-effects";
+import { applyMotionEffectsToImage, applyMotionEffectsToClip } from "../cinematic/motion-effects";
+import { concatFileLine, resolveRenderOptions } from "../cinematic/render-options";
 import type { CinematicTimelineEntry } from "./cinematic-visuals";
-import type { TransitionType } from "../types/cinematic";
+import type { RenderOptions, TransitionType } from "../types/cinematic";
 
-/** Safely delete a file, logging a warning on failure (never throws). */
-function safeUnlink(filePath: string): void {
-  try {
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      console.log(`[Assembly] Deleted temp file: ${path.basename(filePath)}`);
-    }
-  } catch (err) {
-    console.warn(`[Assembly] Could not delete ${filePath}: ${(err as Error).message}`);
-  }
+export interface RenderSceneCheckpoint { sceneIndex: number; inputHash: string; s3Key: string;contentHash?:string }
+export interface AssemblyOptions extends RenderOptions {
+  sceneCache?: RenderSceneCheckpoint[];
+  onSceneComplete?: (checkpoint: RenderSceneCheckpoint) => Promise<void>;
+  musicS3Key?: string;
+  musicVolume?: number;
+  enableTransitions?: boolean;
 }
 
-/** Log current process memory. */
-function logMemory(label: string): void {
-  const mem = process.memoryUsage();
-  console.log(
-    `[Assembly] ${label} — RSS: ${(mem.rss / 1024 / 1024).toFixed(0)}MB` +
-    ` | Heap: ${(mem.heapUsed / 1024 / 1024).toFixed(0)}MB`
-  );
-}
-
-export async function assembleCinematicVideo(
-  jobId: string,
-  timeline: CinematicTimelineEntry[],
-  voiceS3Key: string,
-  tmpDir: string,
-  onLog?: (msg: string) => void
-): Promise<string> {
-  onLog?.(`🎬 Assembling ${timeline.length} cinematic scenes into video`);
-  logMemory("Assembly start");
-
-  // Download voice track
+export async function assembleCinematicVideo(jobId: string, timeline: CinematicTimelineEntry[], voiceS3Key: string,
+  tmpDir: string, onLog?: (msg: string) => void, options: AssemblyOptions = {}): Promise<string> {
+  if (!timeline.length) throw new Error("Cannot assemble an empty timeline");
   const voicePath = path.join(tmpDir, "voice.mp3");
-  const voiceBuffer = await downloadFromS3(voiceS3Key);
-  fs.writeFileSync(voicePath, voiceBuffer);
-
-  // Process each scene sequentially with retry logic.
-  // Temp files are deleted immediately after being added to the concat list
-  // to free disk space and reduce OS page cache pressure.
+  fs.writeFileSync(voicePath, await downloadFromS3(voiceS3Key));
   const processedPaths: string[] = [];
-
+  const available=await new Promise<Record<string,unknown>>((resolve,reject)=>ffmpeg.getAvailableFilters((error,filters)=>error?reject(error):resolve(filters)));
+  const supportsXfade=!!available.xfade;
+  if(!supportsXfade&&timeline.some(entry=>entry.scene.transition_type!=="cut"))onLog?.("This FFmpeg build uses fade-to-black transitions; install a current FFmpeg build for cross-dissolves.");
+  const transitionDurations = timeline.map((entry, index) => supportsXfade && index < timeline.length - 1 && options.enableTransitions !== false && entry.scene.transition_type !== "cut"
+    ? Math.min(0.35, (entry.end_sec - entry.start_sec) / 4, (timeline[index + 1].end_sec - timeline[index + 1].start_sec) / 4) : 0);
   for (let i = 0; i < timeline.length; i++) {
+    options.signal?.throwIfAborted();
     const entry = timeline[i];
-    const scene = entry.scene;
-    const duration = entry.end_sec - entry.start_sec;
+    const duration = entry.end_sec - entry.start_sec + transitionDurations[i];
+    const inputHash = createHash("sha256").update(JSON.stringify({ version: 4, asset: entry.inputHash ?? entry.s3Key,
+      camera: entry.scene.camera_direction, duration, output: resolveRenderOptions(options) })).digest("hex");
     const outPath = path.join(tmpDir, `cinematic_${i}.mp4`);
-
-    onLog?.(
-      `  🎥 Scene ${i + 1}/${timeline.length} (${duration.toFixed(1)}s, ${scene.emotion})`
-    );
-    logMemory(`Before scene ${i + 1}`);
-
-    // Retry once on failure — transient FFmpeg errors can be recovered
-    let lastErr: Error | null = null;
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    const cached = options.sceneCache?.find((item) => item.inputHash === inputHash);
+    let reused = false;
+    if (cached) {
       try {
-        if (attempt > 1) {
-          console.log(`[Assembly] Retrying scene ${i + 1} (attempt ${attempt})...`);
-          safeUnlink(outPath); // clean up partial output from failed attempt
-        }
-
-        if (entry.type === "clip") {
-          await applyMotionEffectsToClip(
-            entry.localPath,
-            outPath,
-            duration,
-            scene.camera_direction,
-            []
-          );
-        } else {
-          await applyMotionEffectsToImage(
-            entry.localPath,
-            outPath,
-            duration,
-            scene.camera_direction,
-            []
-          );
-        }
-
-        if (!fs.existsSync(outPath)) {
-          throw new Error(`Output file not created: ${outPath}`);
-        }
-        const stats = fs.statSync(outPath);
-        if (stats.size === 0) {
-          throw new Error(`Output file is empty: ${outPath}`);
-        }
-
-        console.log(
-          `[Assembly] Scene ${i + 1} OK: ${(stats.size / 1024 / 1024).toFixed(2)} MB`
-        );
-        processedPaths.push(outPath);
-        lastErr = null;
-        break; // success
-      } catch (err) {
-        lastErr = err as Error;
-        console.error(`[Assembly] Scene ${i + 1} attempt ${attempt} failed: ${lastErr.message}`);
-      }
+        fs.writeFileSync(outPath, await downloadFromS3(cached.s3Key));
+        if(cached.contentHash&&createHash("sha256").update(fs.readFileSync(outPath)).digest("hex")!==cached.contentHash)throw new Error("Saved scene render changed");
+        await verifyVideo(outPath, duration, options);
+        reused = true;
+        onLog?.(`Reusing rendered scene ${i + 1}`);
+      } catch { onLog?.(`Saved render for scene ${i + 1} is invalid; rendering it again`); }
     }
-
-    if (lastErr) {
-      throw new Error(`Scene ${i + 1} failed after 2 attempts: ${lastErr.message}`);
+    if (!reused) {
+      // Timeline files belong to another process after a restart; durable references are authoritative.
+      const sourcePath = path.join(tmpDir, `source_${i}.${entry.type === "clip" ? "mp4" : "png"}`);
+      fs.writeFileSync(sourcePath, await downloadFromS3(entry.s3Key));
+      onLog?.(`Rendering scene ${i + 1}/${timeline.length} at ${options.resolution ?? "1080p"}`);
+      const render = entry.type === "clip" ? applyMotionEffectsToClip : applyMotionEffectsToImage;
+      await render(sourcePath, outPath, duration, entry.scene.camera_direction, [], {...options,fadeInDuration:!supportsXfade&&i>0&&timeline[i-1].scene.transition_type!=="cut"?0.25:0,fadeOutDuration:!supportsXfade&&i<timeline.length-1&&entry.scene.transition_type!=="cut"?0.25:0});
+      await verifyVideo(outPath, duration, options);
+      const s3Key = `jobs/${jobId}/rendered-scenes/${i}-${inputHash.slice(0, 20)}.mp4`;
+      await uploadFileToS3(s3Key, outPath, "video/mp4");
+      await options.onSceneComplete?.({ sceneIndex: i, inputHash, s3Key,contentHash:createHash("sha256").update(fs.readFileSync(outPath)).digest("hex") });
+      fs.rmSync(sourcePath, { force: true });
     }
-
-    // Delete the source asset immediately — it's no longer needed
-    safeUnlink(entry.localPath);
-    logMemory(`After scene ${i + 1}`);
+    processedPaths.push(outPath);
   }
-
-  // Write concat list
-  const concatListPath = path.join(tmpDir, "concat.txt");
-  const concatContent = processedPaths
-    .map((p) => `file '${p.replace(/\\/g, "/")}'`)
-    .join("\n");
-  fs.writeFileSync(concatListPath, concatContent);
-  console.log(`[Assembly] Concat list: ${processedPaths.length} scenes`);
-
-  // Concatenate all 720p scenes → upscale to 1080p in one pass.
-  // This is the ONLY place 1080p encoding happens, keeping peak RAM low.
   const concatenatedPath = path.join(tmpDir, "concatenated.mp4");
-  onLog?.("🔗 Concatenating and upscaling to 1080p...");
-  logMemory("Before concat");
-  await concatAndUpscale(concatListPath, concatenatedPath);
-
-  // Delete per-scene files now that concat is done
-  for (const p of processedPaths) {
-    safeUnlink(p);
+  onLog?.("Combining scenes at their native output size");
+  if (transitionDurations.some((duration) => duration > 0)) {
+    await concatWithTransitions(processedPaths, timeline, transitionDurations, concatenatedPath, options);
+  } else {
+    const concatPath = path.join(tmpDir, "concat.txt");
+    fs.writeFileSync(concatPath, processedPaths.map(concatFileLine).join("\n"));
+    await runFFmpeg(ffmpeg().input(concatPath).inputOptions(["-f", "concat", "-safe", "0"])
+      .outputOptions(["-c:v", "copy", "-an", "-movflags", "+faststart"]).output(concatenatedPath), undefined, options.signal);
   }
-
-  const concatStats = fs.statSync(concatenatedPath);
-  console.log(
-    `[Assembly] Concatenated (1080p): ${(concatStats.size / 1024 / 1024).toFixed(2)} MB`
-  );
-  logMemory("After concat");
-
-  // Mix voiceover
-  const rawVideoPath = path.join(tmpDir, "raw_video.mp4");
-  onLog?.("🎵 Mixing voiceover...");
-  await mixCinematicAudio(concatenatedPath, voicePath, rawVideoPath);
-
-  // Delete concatenated file — raw_video.mp4 is the new source
-  safeUnlink(concatenatedPath);
-  safeUnlink(voicePath);
-
-  const rawStats = fs.statSync(rawVideoPath);
-  console.log(`[Assembly] Raw video: ${(rawStats.size / 1024 / 1024).toFixed(2)} MB`);
-  logMemory("After audio mix");
-
-  // Upload to S3
+  const rawPath = path.join(tmpDir, "raw_video.mp4");
+  let musicPath: string | undefined;
+  if (options.musicS3Key) {
+    musicPath = path.join(tmpDir, "licensed-music.audio");
+    fs.writeFileSync(musicPath, await downloadFromS3(options.musicS3Key));
+  }
+  await mixCinematicAudio(concatenatedPath, voicePath, rawPath, musicPath, options);
   const s3Key = `jobs/${jobId}/raw_video.mp4`;
-  await uploadFileToS3(s3Key, rawVideoPath, "video/mp4");
-  onLog?.(`✓ Raw video uploaded: ${s3Key}`);
-
+  await uploadFileToS3(s3Key, rawPath, "video/mp4");
+  for (const file of [...processedPaths, concatenatedPath, voicePath, ...(musicPath ? [musicPath] : [])]) fs.rmSync(file, { force: true });
   return s3Key;
 }
 
-/**
- * Concatenate 720p scene clips and upscale to 1080p in a single pass.
- *
- * BEFORE: concat at 1080p (medium preset) → high RAM
- * AFTER:  concat 720p inputs → scale to 1080p → veryfast preset → low RAM
- *
- * The scale filter runs on the already-decoded stream so it adds minimal overhead.
- */
-function concatAndUpscale(
-  concatListPath: string,
-  outputPath: string
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    console.log(`[Assembly] Concat+upscale: ${concatListPath} → ${outputPath}`);
-
-    ffmpeg()
-      .input(concatListPath)
-      .inputOptions(["-f", "concat", "-safe", "0"])
-      .videoFilters([
-        // Upscale from 720p to 1080p with high-quality Lanczos
-        "scale=1920:1080:flags=lanczos",
-        "setsar=1",
-        "setdar=16/9",
-      ])
-      .outputOptions([
-        "-c:v", "libx264",
-        "-preset", "veryfast",  // was: medium — saves ~1GB RAM during encode
-        "-crf", "20",           // final quality CRF (higher than intermediates)
-        "-pix_fmt", "yuv420p",
-        "-r", "30",
-        "-an",
-        "-threads", "2",
-        "-max_muxing_queue_size", "1024",
-      ])
-      .output(outputPath)
-      .on("start", (cmd) => {
-        console.log(`[Assembly] Concat FFmpeg: ${cmd.substring(0, 300)}...`);
-      })
-      .on("progress", (progress) => {
-        if (progress.percent) {
-          console.log(`[Assembly] Concat progress: ${progress.percent.toFixed(1)}%`);
-        }
-      })
-      .on("end", () => {
-        console.log(`[Assembly] Concat+upscale complete`);
-        resolve();
-      })
-      .on("error", (err, stdout, stderr) => {
-        console.error(`[Assembly] Concat error: ${err.message}`);
-        console.error(`[Assembly] FFmpeg stderr:\n${stderr?.slice(-1000)}`);
-        reject(err);
-      })
-      .run();
-  });
+export function transitionFilter(type: TransitionType): string {
+  const filters: Record<TransitionType, string> = { cut: "fade", fade: "fade", dissolve: "dissolve", wipe: "wipeleft",
+    "blur transition": "fadeblack", "fade through fog": "fadegrays", "light flash": "fadewhite", "particle dissolve": "dissolve" };
+  return filters[type];
 }
 
-/**
- * Mix video with voiceover.
- *
- * Removed loudnorm (CPU/RAM intensive) — replaced with simple acompressor.
- * Audio quality is identical for speech content.
- */
-function mixCinematicAudio(
-  videoPath: string,
-  audioPath: string,
-  outputPath: string
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    console.log(`[Assembly] Audio mix: ${path.basename(videoPath)} + ${path.basename(audioPath)}`);
-
-    ffmpeg()
-      .input(videoPath)
-      .input(audioPath)
-      .outputOptions([
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "128k",          // was: 192k — 128k is transparent for speech
-        "-af", "acompressor=threshold=-20dB:ratio=4:attack=5:release=50",
-        // Removed: loudnorm — it requires two-pass analysis, doubles processing time
-        "-shortest",
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-threads", "2",
-      ])
-      .output(outputPath)
-      .on("start", (cmd) => {
-        console.log(`[Assembly] Audio mix FFmpeg: ${cmd.substring(0, 200)}...`);
-      })
-      .on("progress", (progress) => {
-        if (progress.percent) {
-          console.log(`[Assembly] Audio mix: ${progress.percent.toFixed(1)}%`);
-        }
-      })
-      .on("end", () => {
-        console.log(`[Assembly] Audio mix complete`);
-        resolve();
-      })
-      .on("error", (err, stdout, stderr) => {
-        console.error(`[Assembly] Audio mix error: ${err.message}`);
-        console.error(`[Assembly] FFmpeg stderr:\n${stderr?.slice(-500)}`);
-        reject(err);
-      })
-      .run();
-  });
+async function concatWithTransitions(paths: string[], timeline: CinematicTimelineEntry[], durations: number[], output: string, options: AssemblyOptions): Promise<void> {
+  const command = ffmpeg();
+  paths.forEach((file) => command.input(file));
+  const filters = paths.map((_, index) => `[${index}:v]settb=AVTB,setpts=PTS-STARTPTS[v${index}]`);
+  let previous = "v0";
+  let offset = 0;
+  for (let i = 1; i < paths.length; i++) {
+    offset += timeline[i - 1].end_sec - timeline[i - 1].start_sec;
+    const next = `joined${i}`;
+    filters.push(durations[i - 1] > 0
+      ? `[${previous}][v${i}]xfade=transition=${transitionFilter(timeline[i - 1].scene.transition_type)}:duration=${durations[i - 1]}:offset=${offset}[${next}]`
+      : `[${previous}][v${i}]concat=n=2:v=1:a=0[${next}]`);
+    previous = next;
+  }
+  await runFFmpeg(command.complexFilter(filters).outputOptions(["-map", `[${previous}]`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+    "-pix_fmt", "yuv420p", "-an", "-threads", "2", "-filter_complex_threads", "1", "-movflags", "+faststart"]).output(output), 30 * 60_000, options.signal);
 }
 
-/**
- * Apply transition effect between two clips (not currently used in main pipeline)
- */
-function applyTransition(
-  clip1Path: string,
-  clip2Path: string,
-  outputPath: string,
-  transitionType: TransitionType,
-  transitionDuration: number = 1
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let filterComplex = "";
+async function mixCinematicAudio(video: string, voice: string, output: string, music: string | undefined, options: AssemblyOptions): Promise<void> {
+  const command = ffmpeg().input(video).input(voice);
+  if (music) {
+    command.input(music).inputOptions(["-stream_loop", "-1"]);
+    const volume = Math.max(0, Math.min(0.5, options.musicVolume ?? 0.15));
+    command.complexFilter(["[1:a]asplit=2[speech][sidechain]", `[2:a]volume=${volume}[music]`,
+      "[music][sidechain]sidechaincompress=threshold=0.025:ratio=8:attack=10:release=250[ducked]",
+      "[speech][ducked]amix=inputs=2:duration=first:dropout_transition=0,volume=2,alimiter=limit=0.95[a]"]);
+  }
+  command.outputOptions(["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-shortest", "-map", "0:v:0", "-map", music ? "[a]" : "1:a:0",
+    "-threads", "2", "-movflags", "+faststart"]);
+  await runFFmpeg(command.output(output), undefined, options.signal);
+}
 
-    switch (transitionType) {
-      case "fade":
-        filterComplex = `[0:v][1:v]xfade=transition=fade:duration=${transitionDuration}:offset=0[v]`;
-        break;
-      case "dissolve":
-        filterComplex = `[0:v][1:v]xfade=transition=dissolve:duration=${transitionDuration}:offset=0[v]`;
-        break;
-      case "wipe":
-        filterComplex = `[0:v][1:v]xfade=transition=wipeleft:duration=${transitionDuration}:offset=0[v]`;
-        break;
-      case "blur transition":
-        filterComplex = `[0:v][1:v]xfade=transition=fadeblack:duration=${transitionDuration}:offset=0[v]`;
-        break;
-      default:
-        filterComplex = `[0:v][1:v]concat=n=2:v=1:a=0[v]`;
-    }
-
-    ffmpeg()
-      .input(clip1Path)
-      .input(clip2Path)
-      .complexFilter(filterComplex)
-      .outputOptions([
-        "-map", "[v]",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-threads", "2",
-      ])
-      .output(outputPath)
-      .on("end", () => resolve())
-      .on("error", reject)
-      .run();
-  });
+function verifyVideo(file: string, expectedDuration: number, options: RenderOptions): Promise<void> {
+  return new Promise((resolve, reject) => ffmpeg.ffprobe(file, (error, metadata) => {
+    if (error) return reject(error);
+    const video = metadata.streams.find((stream) => stream.codec_type === "video");
+    const { width, height } = resolveRenderOptions(options);
+    if (video?.width !== width || video?.height !== height || Math.abs((metadata.format.duration ?? 0) - expectedDuration) > 0.15)
+      return reject(new Error("Saved scene render does not match its output settings or duration"));
+    resolve();
+  }));
 }

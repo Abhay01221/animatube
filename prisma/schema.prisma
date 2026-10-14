@@ -70,6 +70,7 @@ model User {
   accounts Account[]
   sessions Session[]
   videos   Video[]
+  creditLedger CreditLedger[]
 
   createdAt DateTime @default(now())
 }
@@ -80,6 +81,17 @@ model Video {
   user   User   @relation(fields: [userId], references: [id])
 
   jobId  String @unique
+  requestKey String?
+  generationOptions Json?
+  generationManifest Json?
+  renderRevision Int @default(1)
+  approvedRevision Int?
+  queueVersion Int @default(1)
+  executionToken String?
+  executionLease DateTime?
+  creditState String @default("legacy")
+  parentVideoId String?
+  channelProfileId String?
   
   // Legacy status field (kept for backward compatibility)
   status String @default("pending") // pending | processing | completed | failed
@@ -127,7 +139,9 @@ model Video {
   // YouTube upload (completely optional)
   youtubeId    String?
   youtubeUrl   String?
+  publicationHistory Json?
   thumbnailUrl String?
+  thumbnailKey String?
 
   // Error tracking (separate for render vs upload)
   renderError String? @db.Text
@@ -135,4 +149,47 @@ model Video {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  @@unique([userId, requestKey])
+  @@index([userId, createdAt])
+  @@index([userId, deletedAt, createdAt])
+}
+
+model CreditLedger {
+  id String @id @default(cuid())
+  userId String
+  user User @relation(fields: [userId], references: [id])
+  jobId String
+  operationKey String @unique
+  amount Int
+  reason String
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model JobOutbox {
+  id String @id
+  jobId String
+  kind String
+  payload Json
+  status String @default("pending")
+  attempts Int @default(0)
+  leaseUntil DateTime?
+  lastError String?
+  createdAt DateTime @default(now())
+  dispatchedAt DateTime?
+
+  @@index([status, leaseUntil])
+}
+
+model ChannelProfile {
+  id String @id @default(cuid())
+  userId String
+  name String
+  settings Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([userId])
 }

@@ -14,20 +14,23 @@ import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
   updateProfile,
+  sendEmailVerification,
 } from "firebase/auth";
 import { auth, googleProvider } from "@/lib/firebase";
 import { toast } from "sonner";
+import { safeCallback } from "@/components/generation-state";
 
 type Tab = "signin" | "register";
 
 function SignInForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const callbackUrl = searchParams?.get("callbackUrl") || "/dashboard";
+  const callbackUrl = safeCallback(searchParams?.get("callbackUrl"));
 
   const [tab, setTab] = useState<Tab>("signin");
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
+  const [verificationNotice,setVerificationNotice]=useState(false);
 
   // Sign In form state
   const [signInEmail, setSignInEmail] = useState("");
@@ -48,10 +51,10 @@ function SignInForm() {
   /**
    * Sync Firebase user to Prisma database
    */
-  async function syncUser() {
+  async function syncUser(): Promise<boolean> {
     try {
       const user = auth.currentUser;
-      if (!user) return;
+      if (!user) return false;
 
       const token = await user.getIdToken(true);
       const res = await fetch("/api/auth/sync-user", {
@@ -62,10 +65,14 @@ function SignInForm() {
       });
 
       if (!res.ok) {
-        console.error("[sign-in] Failed to sync user:", await res.text());
+        const message = await res.text();
+        console.error("[sign-in] Failed to sync user:", message);
+        return false;
       }
+      return true;
     } catch (error) {
       console.error("[sign-in] Error syncing user:", error);
+      return false;
     }
   }
 
@@ -75,15 +82,17 @@ function SignInForm() {
     setLoading(true);
 
     try {
-      await signInWithEmailAndPassword(auth, signInEmail, signInPassword);
-      await syncUser();
+      const credential=await signInWithEmailAndPassword(auth, signInEmail, signInPassword);
+      if(!credential.user.emailVerified){setVerificationNotice(true);return;}
+      if (!await syncUser()) throw new Error("Unable to sync account");
       router.push(callbackUrl);
       router.refresh();
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
       console.error("[sign-in] Error:", error);
-      if (error.code === "auth/invalid-credential" || error.code === "auth/user-not-found") {
+      if (code === "auth/invalid-credential" || code === "auth/user-not-found") {
         setSignInError("Invalid email or password");
-      } else if (error.code === "auth/too-many-requests") {
+      } else if (code === "auth/too-many-requests") {
         setSignInError("Too many failed attempts. Please try again later.");
       } else {
         setSignInError("An error occurred. Please try again.");
@@ -127,19 +136,17 @@ function SignInForm() {
       // Reload user to ensure token includes display name
       await userCredential.user.reload();
 
-      // Sync to Prisma database
-      await syncUser();
-
-      // Redirect to dashboard
-      router.push(callbackUrl);
-      router.refresh();
-    } catch (error: any) {
+      await sendEmailVerification(userCredential.user);
+      setVerificationNotice(true);setTab("signin");setSignInEmail(registerEmail);
+      toast.success("Verification email sent. Verify your email, then continue.");
+    } catch (error: unknown) {
+      const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
       console.error("[register] Error:", error);
-      if (error.code === "auth/email-already-in-use") {
+      if (code === "auth/email-already-in-use") {
         setRegisterErrors({ email: "An account with this email already exists" });
-      } else if (error.code === "auth/invalid-email") {
+      } else if (code === "auth/invalid-email") {
         setRegisterErrors({ email: "Invalid email address" });
-      } else if (error.code === "auth/weak-password") {
+      } else if (code === "auth/weak-password") {
         setRegisterErrors({ password: "Password is too weak" });
       } else {
         setRegisterErrors({ general: "Registration failed. Please try again." });
@@ -153,15 +160,18 @@ function SignInForm() {
     setGoogleLoading(true);
     try {
       await signInWithPopup(auth, googleProvider);
-      await syncUser();
+      if (!await syncUser()) throw new Error("Unable to sync account");
       router.push(callbackUrl);
       router.refresh();
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
       console.error("[google-signin] Error:", error);
-      if (error.code === "auth/popup-closed-by-user") {
+      if (code === "auth/popup-closed-by-user") {
         toast.error("Sign-in cancelled");
-      } else if (error.code === "auth/popup-blocked") {
+      } else if (code === "auth/popup-blocked") {
         toast.error("Popup blocked. Please allow popups for this site.");
+      } else if(code==="auth/unauthorized-domain") {
+        toast.error("This address is not enabled for sign-in. Open the configured app address or contact the app owner.");
       } else {
         toast.error("Google sign-in failed. Please try again.");
       }
@@ -209,6 +219,7 @@ function SignInForm() {
           </div>
 
           {/* Tab switcher */}
+          {verificationNotice&&<div className="mb-4 space-y-2 rounded-lg border border-amber-800 p-3 text-sm text-amber-200"><p>Check your inbox and verify your email before continuing. Your video draft is saved.</p><button type="button" className="mr-3 underline" onClick={async()=>{if(!auth.currentUser)return;await auth.currentUser.reload();if(auth.currentUser.emailVerified&&await syncUser()){router.push(callbackUrl);router.refresh();}else toast.error("Email verification is not complete yet");}}>I have verified my email</button><button type="button" className="underline" onClick={async()=>{if(!auth.currentUser)return;try{await sendEmailVerification(auth.currentUser);toast.success("Verification email sent");}catch{toast.error("Unable to send another email yet. Please try later.");}}}>Resend email</button></div>}
           <div className="flex gap-2 mb-6 bg-[#0a0a0a] p-1 rounded-lg">
             <button
               onClick={() => setTab("signin")}

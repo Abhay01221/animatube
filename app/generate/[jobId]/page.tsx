@@ -37,7 +37,7 @@ export default async function GeneratePage({ params }: PageProps) {
       </nav>
 
       {/* Content */}
-      <div className="relative z-10 w-full max-w-lg mt-16">
+      <div className="relative z-10 w-full max-w-2xl mt-16">
         {/* Back link */}
         <Link
           href="/"
@@ -51,13 +51,13 @@ export default async function GeneratePage({ params }: PageProps) {
         <div className="text-center mb-10">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium bg-violet-950/50 text-violet-300 border border-violet-800/50 mb-4">
             <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-pulse" />
-            Generating your video
+            Your video workspace
           </div>
           <h1 className="text-2xl font-bold text-white">
-            Your video is being created
+            Review, render, and resume
           </h1>
           <p className="text-zinc-500 text-sm mt-2">
-            Sit back — this takes about 4 minutes
+            Your instructions and completed stages are saved. Return here to review or continue generation.
           </p>
           <p className="text-zinc-700 text-xs mt-1 font-mono">
             Job: {jobId}

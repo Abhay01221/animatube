@@ -18,6 +18,10 @@ export interface CinematicScene {
   shot_type?: ShotType;
   lighting?: string;
   color_palette?: string[];
+  caption?: string;
+  visual_asset?: { s3Key: string; type: "clip" | "image"; provider?: "s3" | "supabase" };
+  diagram?: { title: string; items: string[] };
+  source_references?: Array<{ sourceId: string; passage: string }>;
 }
 
 // ─── Story Planning ───────────────────────────────────────────────────────────
@@ -77,7 +81,7 @@ export interface MotionEffect {
   type: MotionEffectType;
   intensity: number;
   duration: number;
-  parameters: Record<string, any>;
+  parameters: Record<string, unknown>;
 }
 
 // ─── Enums and Types ──────────────────────────────────────────────────────────
@@ -200,4 +204,33 @@ export interface Storyboard {
   scenes: StoryboardScene[];
   overall_style: string;
   created_at: string;
+}
+
+export interface RenderOptions {
+  aspectRatio?: "16:9" | "9:16";
+  resolution?: "720p" | "1080p";
+  frameRate?: 24 | 25 | 30;
+  targetDuration?: number;
+  visualStyle?: string;
+  signal?: AbortSignal;
+  fadeInDuration?: number;
+  fadeOutDuration?: number;
+}
+
+/** Word positions are seconds from the beginning of the complete audio track. */
+export interface TimedWord {
+  text: string;
+  startTime: number;
+  endTime: number;
+  sceneIndex: number;
+}
+
+export interface VoiceSceneCheckpoint {
+  sceneIndex: number;
+  inputHash: string;
+  s3Key: string;
+  durationSeconds: number;
+  contentHash?:string;
+  /** Checkpoint word times are relative to this scene. */
+  words: TimedWord[];
 }

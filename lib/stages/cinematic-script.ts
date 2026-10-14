@@ -8,10 +8,15 @@ import { uploadToS3 } from "../s3";
 import { generateStoryPlan } from "../cinematic/story-planner";
 import { generateSceneScript, type SceneScriptOutput } from "../cinematic/scene-script-generator";
 import type { StoryPlan } from "../types/cinematic";
+import type { RenderOptions } from "../types/cinematic";
 
 export interface CinematicScriptResult {
   storyPlan: StoryPlan;
   script: SceneScriptOutput;
+}
+export interface CinematicScriptOptions extends RenderOptions {
+  savedStoryPlan?: StoryPlan;
+  onStoryPlanComplete?: (plan:StoryPlan,key:string)=>Promise<void>;
 }
 
 export async function generateCinematicScript(
@@ -20,18 +25,20 @@ export async function generateCinematicScript(
   style: string,
   duration: string, // "short" | "long"
   language: string,
-  onLog?: (msg: string) => void
+  onLog?: (msg: string) => void,
+  options: CinematicScriptOptions = {},
 ): Promise<CinematicScriptResult> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error("GROQ_API_KEY is not set");
 
   const durationLabel = duration === "short" ? "3-minute" : "8-minute";
-  onLog?.(`🎬 Generating cinematic ${durationLabel} ${style} video about: ${topic}`);
+  onLog?.(`Generating cinematic ${durationLabel} ${style} video`);
 
   // Phase 1: Story Planning
   onLog?.(`📋 Phase 1: Planning story structure and emotional beats...`);
-  const storyPlan = await generateStoryPlan(
-    { topic, style, duration, language },
+  if(options.savedStoryPlan)onLog?.("Reusing the verified saved story plan");
+  const storyPlan = options.savedStoryPlan ?? await generateStoryPlan(
+    { topic, style, duration, language, visualStyle: options.visualStyle, targetDuration: options.targetDuration },
     onLog
   );
 
@@ -41,6 +48,7 @@ export async function generateCinematicScript(
     JSON.stringify(storyPlan, null, 2),
     "application/json"
   );
+  await options.onStoryPlanComplete?.(storyPlan,`jobs/${jobId}/story-plan.json`);
 
   // Phase 2: Scene Script Generation
   onLog?.(`✍️ Phase 2: Writing scene-by-scene narration...`);
@@ -62,15 +70,6 @@ export async function generateCinematicScript(
   onLog?.(
     `✓ Cinematic script ready: "${script.title}" (${script.scenes.length} scenes, ${storyPlan.total_duration}s total)`
   );
-
-  // Log scene breakdown
-  console.log(`[Cinematic Script] Scene breakdown:`);
-  script.scenes.forEach((scene, i) => {
-    console.log(
-      `[Scene ${i + 1}] ${scene.duration_seconds}s | ${scene.emotion} | ${scene.camera_direction}`
-    );
-    console.log(`  Narration: "${scene.narration.substring(0, 60)}..."`);
-  });
 
   return { storyPlan, script };
 }

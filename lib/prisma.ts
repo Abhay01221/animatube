@@ -9,8 +9,10 @@ import { Pool } from "pg";
 function createPrismaClient() {
   const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
+    max:Number(process.env.PG_POOL_MAX??5),
+    connectionTimeoutMillis:10000,
   });
-  const adapter = new PrismaPg(pool);
+  const adapter = new PrismaPg(pool,{disposeExternalPool:true});
   return new PrismaClient({
     adapter,
     log: process.env.NODE_ENV === "development" ? ["error", "warn"] : ["error"],

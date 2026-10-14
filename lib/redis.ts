@@ -22,7 +22,7 @@ let singletonClient: IORedis | null = null;
  * DO NOT call .quit() on this client.
  */
 export function getRedisClient(): IORedis {
-  if (singletonClient && singletonClient.status === "ready") {
+  if (singletonClient && singletonClient.status !== "end") {
     return singletonClient;
   }
 
@@ -34,11 +34,12 @@ export function getRedisClient(): IORedis {
   console.log("[Redis] Connecting to:", redisUrl.replace(/:\/\/.*@/, "://<credentials>@"));
 
   singletonClient = new IORedis(redisUrl, {
-    maxRetriesPerRequest: null,
+    maxRetriesPerRequest: 2,
+    commandTimeout: 15000,
     enableReadyCheck: false,
     lazyConnect: false,
     // TLS is required for rediss:// (Upstash and other managed Redis providers)
-    tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
+    tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: true } : undefined,
     // Production-safe retry strategy
     retryStrategy: (times: number) => {
       const delay = Math.min(times * 50, 2000);
@@ -76,13 +77,14 @@ export function getRedisClient(): IORedis {
  * so we export a factory rather than a single shared instance.
  * These connections CAN be closed with .quit() when done.
  */
-export function createRedisConnection(): IORedis {
+export function createRedisConnection(role:"worker"|"producer"="worker"): IORedis {
   const redisUrl = getRedisUrl();
   const connection = new IORedis(redisUrl, {
-    maxRetriesPerRequest: null,
+    maxRetriesPerRequest: role==="worker"?null:2,
+    ...(role==="producer"?{commandTimeout:15000}:{}),
     enableReadyCheck: false,
     // TLS is required for rediss:// (Upstash and other managed Redis providers)
-    tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
+    tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: true } : undefined,
     // Production-safe retry strategy
     retryStrategy: (times: number) => {
       const delay = Math.min(times * 50, 2000);

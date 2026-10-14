@@ -1,501 +1,83 @@
-# Animatube 🎬
-
-**AI-Powered Cinematic Video Generation Platform**
-
-Transform text prompts into professional, cinematic videos with AI-generated scripts, voiceovers, visuals, and subtitles. Automatically upload to YouTube or download for later use.
-
----
-
-## 🚀 Features
-
-- **🎭 Cinematic Storytelling**: AI-powered story planning with character development and scene composition
-- **🎙️ Professional Voiceovers**: Natural-sounding narration with multiple voice options
-- **🎨 Dynamic Visuals**: Automatic stock footage and image selection with cinematic motion effects
-- **📝 Animated Subtitles**: Professional subtitle styling with smooth fade animations
-- **📤 YouTube Integration**: Direct upload to YouTube with OAuth authentication
-- **☁️ Cloud Storage**: Persistent video storage on AWS S3 with presigned URLs
-- **📊 Real-time Progress**: Live progress tracking with Server-Sent Events (SSE)
-- **🎯 Multiple Styles**: Educational, storytelling, motivational, documentary, and anime-style
-
----
-
-## 🏗️ Architecture
-
-```
-Frontend (Next.js/Vercel)
-    ↓
-API Routes (Next.js)
-    ↓
-BullMQ Queue (Redis/Upstash)
-    ↓
-Worker Processes (Railway)
-    ↓
-FFmpeg Rendering Pipeline
-    ↓
-S3 Storage (AWS)
-    ↓
-Dashboard Playback/Download
-```
+# Animatube
 
-**Key Components:**
-- **Frontend**: Next.js 16, React 19, TailwindCSS, Framer Motion
-- **Backend**: Next.js API Routes, NextAuth, Prisma ORM
-- **Queue**: BullMQ with Redis (Upstash)
-- **Workers**: Node.js workers with FFmpeg
-- **Database**: PostgreSQL (Supabase)
-- **Storage**: AWS S3 with presigned URLs
-- **AI**: Groq (LLaMA), Pexels API, Edge TTS
+Create narrated videos from a saved prompt, review a storyboard, render the approved revision, then download or optionally publish to YouTube. Firebase handles app identity; YouTube uses a separate connection in Settings.
 
----
+## Development setup
 
-## 📦 Tech Stack
+Use Node.js 20+, PostgreSQL, Redis, a private S3 bucket, Firebase Authentication, Groq and Pexels credentials. FFmpeg/ffprobe are bundled by installer packages; workers need writable temporary storage and sufficient CPU, memory and disk. Install a Devanagari font such as Noto Sans Devanagari for Hindi captions; set SUBTITLE_FONT_DIR to its directory if needed.
 
-### Frontend
-- **Next.js 16**: React framework with App Router
-- **React 19**: UI library
-- **TailwindCSS 4**: Utility-first CSS
-- **Framer Motion**: Animations
-- **shadcn/ui**: Component library
+1. Run `npm ci`.
+2. Copy `.env.production.example` to a local environment file and supply credentials. Use `NODE_ENV=development` and `APP_URL=http://localhost:3000` locally. Preserve existing credential files.
+3. Enable Firebase Google and/or email/password sign-in and add your app hosts to Firebase authorized domains. Email/password accounts must verify their email.
+4. Review/apply migrations below, then run `npm run db:generate`.
+5. Run `npm run dev` and `npm run worker` in separate terminals.
 
-### Backend
-- **NextAuth v5**: Authentication with Google OAuth
-- **Prisma 7**: Database ORM
-- **BullMQ**: Job queue with Redis
-- **FFmpeg**: Video processing
-- **AWS SDK**: S3 storage
+Both processes need database, Redis, storage and provider configuration. The worker loads Next.js environment files. worker-entry.ts starts rendering, independent publishing, durable outbox dispatch and interruption recovery. Web hosting alone cannot process queued renders.
 
-### AI & Media
-- **Groq API**: LLaMA 3.3 for script generation
-- **Pexels API**: Stock footage and images
-- **Edge TTS**: Text-to-speech voiceovers
+For Windows development with Ubuntu WSL, install Ubuntu's redis-server package, then run `npm run local:redis`. This starts a password-protected loopback Redis instance on port 6380 with persistent AOF storage and adds a local REDIS_URL override without modifying cloud credentials in .env. Run it again after WSL/machine restarts. Restart web/worker processes after environment changes. Run `npm run check:runtime` to verify database and queue connectivity without generating videos.
 
-### Infrastructure
-- **Vercel**: Frontend hosting
-- **Railway**: Worker hosting with Docker
-- **Supabase**: PostgreSQL database
-- **Upstash**: Redis queue
-- **AWS S3**: Video storage
+## Database migrations
 
----
+For an existing original installation, `npm run db:setup` saves a local schema/credit snapshot, baselines the existing tables and applies the additive migrations. The Prisma CLI now follows the same environment-file precedence as the app. Supabase migrations use session port 5432; use DIRECT_URL for a dedicated migration connection when needed. A successful `npx prisma migrate status` should report that the database is up to date.
 
-## 🚀 Quick Start (Development)
+Back up an existing database and review prisma/migrations before applying. The additive migration preserves balances and existing records. Historical jobs use legacy credit state so past charges are not guessed or refunded.
 
-### Prerequisites
-- Node.js 20+
-- FFmpeg installed
-- PostgreSQL database
-- Redis instance
-- AWS S3 bucket
-- Google OAuth credentials
+For a new database, run `npm run db:deploy`. For an existing original schema with no migration history, compare it with 20261010000000_initial/migration.sql, then baseline it with `npx prisma migrate resolve --applied 20261010000000_initial`. Preserve any existing Firebase migration history. Run `npm run db:deploy` for the remaining migrations. Do not reset production or use db:push as a production migration strategy.
 
-### Installation
+New fields include saved options, render/approval revisions, execution leases and a versioned stage/scene manifest. New tables hold the credit ledger, transactional queue outbox and channel profiles.
 
-```bash
-# Clone repository
-git clone https://github.com/yourusername/animatube.git
-cd animatube
+## Resume generation
 
-# Install dependencies
-npm install
+Checkpoints cover script, voice, visuals, assembly, captions and final storage, recording input/output hashes, attempts, timestamps, elapsed time and output references. Provider cost is recorded only when supplied. Scene speech, visuals and rendered clips are cached where practical.
 
-# Configure environment variables
-cp .env.example .env
-# Edit .env with your credentials
+Retry or **Resume generation** loads the saved instructions and approved revision, checks availability/checksums, skips valid completed work, and invalidates descendants of changed or missing outputs. The UI previews reused stages and where work will restart. Execution leases and queue versions prevent simultaneous renders. The worker reconciles interrupted jobs without requiring the browser to stay open.
 
-# Setup database
-npm run db:generate
-npm run db:push
+FFmpeg restarts an incomplete stage or scene encode; arbitrary mid-encode continuation is not supported. **Start over** creates a separate generation.
 
-# Start development server
-npm run dev
+Keep private jobs/ checkpoint objects at least 30 days if offering a 30-day resume window. The app does not automatically delete them. Remove conflicting seven-day bucket lifecycle policies. Keep final videos and uploaded references while projects remain available. Expired/missing objects require regeneration; the resume preview reports invalid stages.
 
-# Start worker (in separate terminal)
-npm run worker
-```
+To test recovery without paid services, run `npm test`. An isolated integration test fails assembly after script/speech/visual fixtures are saved, resumes the same job, and verifies those providers are not called again. Other tests fail each major stage and check invalidation, ownership, credits and publishing retries.
 
-Visit `http://localhost:3000`
+In the UI: open a failed/interrupted job from Dashboard or its progress page, click **Resume generation**, review reused stages and cost, then resume. No prompt re-entry is needed. Approve the storyboard first if waiting for review. Resolve a provider outage before its failed stage can succeed.
 
----
+## Credits and submission
 
-## 🌐 Production Deployment
+A new generation reserves one app credit. Debit, job and outbox commit together. Request keys deduplicate repeated submissions and conditional balance updates prevent overdrafts. Queue acknowledgment failures leave durable intents to reconcile rather than speculative refunds.
 
-### Quick Deploy
+Automatic retries reuse the reservation. A terminal render failure refunds once. Manual resume re-reserves that refunded credit, disclosed before submission. Successful renders consume the reservation. Approving an edited/regenerated completed video reserves one further credit, including edits first saved as drafts. Replacement failures follow the same refund policy. Upload retries do not charge a generation credit or re-render. External provider billing can still accrue for repeated work. The pilot has a fixed allowance and no payment checkout.
 
-1. **Database**: Create Supabase project
-2. **Redis**: Create Upstash Redis database
-3. **S3**: Create AWS S3 bucket
-4. **OAuth**: Configure Google OAuth credentials
-5. **Frontend**: Deploy to Vercel
-6. **Workers**: Deploy to Railway
+## Private storage and YouTube
 
-### Detailed Guide
+S3 stores checkpoints/user uploads. Final videos use Supabase Storage when configured, with S3 fallback. Keep Supabase's videos bucket private and S3 public access blocked. lib/assets.ts routes verification, reads, downloads and signed playback URLs by provider. App privacy is independent of YouTube visibility.
 
-See **[DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md)** for complete step-by-step instructions.
+Enable YouTube Data API v3. Configure a Web OAuth client with exact callback `APP_URL/api/youtube/callback`. Supply GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and a random 32-byte hex ENCRYPTION_KEY. Connect in Settings, grant offline authorization, then publish a completed render. State/PKCE validation, encrypted refresh tokens and disconnect operate independently of Firebase login. Configure Google OAuth consent test users or verification as your project requires.
 
-### Deployment Checklist
+Publishing has a separate queue/error state. Retry reuses the rendered cloud asset and existing remote IDs. A crash after YouTube accepts an upload but before its ID is stored can require manual duplicate reconciliation; remote exactly-once delivery is not guaranteed.
 
-See **[PRODUCTION_CHECKLIST.md](./PRODUCTION_CHECKLIST.md)** for comprehensive checklist.
+## Editing and product features
 
-### Test Production Setup
+Storyboard editing covers narration, timing, captions, source passages, media replacement, diagrams, scene order/removal and selected voice/visual regeneration. Saving is rejected during active generation or a revision conflict while edits remain in the open editor. Unchanged scene inputs reuse valid caches.
 
-```bash
-npm run test:production
-```
+Native 16:9/9:16, 720p/1080p and 24/30 FPS reach rendering. Speech uses language-specific voices, measured scene durations and word boundaries. Caption presets, pronunciation overrides and licensed uploaded music with speech ducking are supported. Publication tools provide MP4, SRT/VTT, metadata, thumbnails, selected-scene Shorts and language variants linked to the parent. Shorts require editorial hook/framing review; translations require localization review.
 
----
+Channel profiles supply reusable preferences and earlier episode titles to generation. Sources are pasted approved text with optional provenance URLs; URLs are labels, not automatic fetching. Scene passages must match source text. Unsupported scenes are flagged. Corrections can be applied across narration, captions and diagrams. These tools assist review and do not verify every factual claim. PDF/web ingestion, automatic semantic fact checking, voice cloning and animated character continuity are not implemented.
 
-## 📖 Documentation
+Stock is the default style. Generated illustration/anime requires a configured provider and does not imply consistent characters. Set GENERATED_VISUAL_ENDPOINT, optional bearer key/provider name, and estimated USD per second. The endpoint accepts JSON `{prompt, sceneIndex, duration, width, height}` and returns PNG/JPEG/WebP/MP4 bytes with correct Content-Type, within 180 seconds and 50 MB. Pricing remains an estimate unless actual provider cost is available.
 
-- **[DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md)**: Complete production deployment guide
-- **[PRODUCTION_CHECKLIST.md](./PRODUCTION_CHECKLIST.md)**: Pre-deployment checklist
-- **[DEVELOPER_GUIDE.md](./DEVELOPER_GUIDE.md)**: Development guide
-- **[CINEMATIC_ARCHITECTURE.md](./CINEMATIC_ARCHITECTURE.md)**: Cinematic system architecture
-- **[SUBTITLE_SYSTEM_UPGRADE.md](./SUBTITLE_SYSTEM_UPGRADE.md)**: Subtitle system documentation
+## Verification and operations
 
----
+Run `npm run typecheck`, `npm run lint`, `npm test` and `npm run build`. Tests use isolated PGlite PostgreSQL-compatible storage, local fake cloud/provider responses and actual FFmpeg fixture renders; they do not modify your production DB or publish videos. Live Firebase/YouTube/provider integration needs a configured staging smoke test.
 
-## 🎯 Usage
+Hosted Redis should use TLS; certificate validation is enabled. Submission limits use the database and do not silently bypass errors. Monitor outbox backlog, worker errors, disk use and bucket retention. Keep credentials out of source control. Avoid logging raw prompts and tokens.
 
-### 1. Login
-- Sign in with Google OAuth
-- Authorize YouTube access (optional)
+Channel profiles can also store approved uploaded image/video references. Select a saved reference for each storyboard scene to use those exact bytes in rendering; automatic generated character continuity remains unsupported.
 
-### 2. Generate Video
-- Enter a text prompt (e.g., "The history of ancient Rome")
-- Select style (educational, storytelling, etc.)
-- Choose duration (short: 30-60s, long: 60-120s)
-- Select voice (male, female, AI narrator)
-- Click "Generate Video"
+Groq 429 responses now honor Retry-After (or the provider's retry delay), add a safety margin, and retry up to five times within a bounded waiting budget. A verified story-plan sub-checkpoint is saved before narration so a later failure does not repeat planning. Persistent/day-long limits pause with Resume generation guidance; creating another key does not increase an organization quota.
 
-### 3. Monitor Progress
-- Real-time progress tracking
-- 6 stages: Script → Voice → Visuals → Assembly → Subtitles → Upload
-- Live logs and status updates
+Downloads verify that the stored file exists, then issue a five-minute encrypted ticket for a same-origin attachment endpoint. The server streams the video rather than buffering it. If an automatic download is blocked, use the visible Save MP4 link; prepare a new link after expiry. Hosting must allow the connection to remain open for the file transfer.
 
-### 4. Download or Share
-- Download MP4 file
-- View on YouTube (if uploaded)
-- Share with others
+Video cards include Delete video with a confirmation. Deletion moves the record to recoverable Trash, hides it from generation/download/publishing endpoints, and preserves stored assets, credits, downloaded copies and existing YouTube publications. Use Trash → Restore video to recover it. Active generation/upload jobs must finish before deletion. Playback pins the current asset URL across dashboard refreshes; expired URLs renew from the saved position without restarting at zero.
 
----
+Trash cards also include **Delete permanently**. After irreversible confirmation, the app deletes the cloud final video, subtitles, dedicated thumbnail, and all render attempts/checkpoints under that project's exact S3/Supabase namespaces, then removes the Video record. S3 versions and delete markers are included. The S3 worker identity needs `s3:ListBucket`, `s3:ListBucketVersions`, `s3:GetObject`, `s3:DeleteObject`, and `s3:DeleteObjectVersion`; retention locks or missing permissions leave cleanup pending instead of reporting success. Supabase uses the existing service-role storage client. No additional schema migration is needed.
 
-## 🔧 Configuration
-
-### Environment Variables
-
-See `.env.production.example` for all required variables:
-
-```bash
-# Core
-DATABASE_URL=postgresql://...
-REDIS_URL=rediss://...
-NEXTAUTH_SECRET=...
-NEXTAUTH_URL=https://your-domain.com
-
-# OAuth
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-
-# AI APIs
-GROQ_API_KEY=...
-PEXELS_API_KEY=...
-
-# Storage
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-AWS_S3_BUCKET=...
-AWS_REGION=...
-
-# Security
-ENCRYPTION_KEY=...
-```
-
----
-
-## 🎬 Video Generation Pipeline
-
-### Stage 1: Script Generation
-- AI-powered story planning
-- Character development
-- Scene composition
-- Cinematic direction
-
-### Stage 2: Voiceover
-- Text-to-speech synthesis
-- Natural-sounding narration
-- Multiple voice options
-- Uploaded to S3
-
-### Stage 3: Visuals
-- Stock footage search (Pexels)
-- Image selection
-- Visual matching to script
-- Downloaded locally
-
-### Stage 4: Assembly
-- FFmpeg video processing
-- Cinematic motion effects (zoom, pan, tilt)
-- Transitions between scenes
-- Audio mixing
-
-### Stage 5: Subtitles
-- Phrase-by-phrase timing
-- Cinematic styling
-- Smooth fade animations
-- Burned into video
-
-### Stage 6: Upload (Optional)
-- YouTube OAuth
-- Automatic upload
-- Metadata (title, description, tags)
-- Thumbnail generation
-
----
-
-## 📊 Performance
-
-- **Generation Time**: 3-5 minutes per video
-- **Concurrent Jobs**: 2 per worker
-- **Worker Scaling**: 2-5 replicas recommended
-- **Storage**: ~50-100MB per video
-- **Rate Limit**: 5 videos/hour per user
-
----
-
-## 🔒 Security
-
-- ✅ OAuth tokens encrypted in database
-- ✅ S3 presigned URLs (not public)
-- ✅ Rate limiting enabled
-- ✅ HTTPS enforced
-- ✅ Environment variables secured
-- ✅ API routes protected with auth
-
----
-
-## 💰 Cost Estimate
-
-**Monthly costs for moderate usage:**
-
-- **Vercel**: Free tier (sufficient for most)
-- **Railway**: $5-20 (worker usage)
-- **Supabase**: Free tier (small projects)
-- **Upstash**: Free tier (10K commands/day)
-- **AWS S3**: ~$0.023/GB/month storage
-- **Total**: ~$10-30/month
-
----
-
-## 🐛 Troubleshooting
-
-### Workers Not Processing
-- Check Railway logs
-- Verify Redis connection
-- Restart worker
-
-### Videos Not Appearing
-- Check database (Prisma Studio)
-- Verify S3 upload
-- Check presigned URLs
-
-### FFmpeg Errors
-- Verify FFmpeg installed
-- Check Railway logs
-- Test locally
-
-See **[DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md)** for detailed troubleshooting.
-
----
-
-## 🤝 Contributing
-
-Contributions welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
-
----
-
-## 📄 License
-
-MIT License - see LICENSE file for details
-
----
-
-## 🙏 Acknowledgments
-
-- **Groq**: Fast LLaMA inference
-- **Pexels**: Free stock footage
-- **FFmpeg**: Video processing
-- **Vercel**: Frontend hosting
-- **Railway**: Worker hosting
-
----
-
-## 📞 Support
-
-- **Documentation**: See `/docs` folder
-- **Issues**: GitHub Issues
-- **Email**: support@animatube.com
-
----
-
-## 🗺️ Roadmap
-
-- [ ] Custom voice cloning
-- [ ] Advanced video editing
-- [ ] Multi-language support
-- [ ] Custom branding
-- [ ] Team collaboration
-- [ ] Analytics dashboard
-
----
-
-**Built with ❤️ by the Animatube team**
-
-🚀 **Ready to deploy?** See [DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md) — AI-Powered Video Factory
-
-Turn any idea into a published YouTube video automatically.
-
-**Pipeline:** Prompt → Groq Script → Edge TTS Voiceover → Pexels/Canvas Visuals → FFmpeg Assembly → Subtitles → YouTube Upload
-
----
-
-## Prerequisites
-
-- Node.js 18+
-- PostgreSQL database (Supabase or Railway recommended)
-- Redis (local or Upstash)
-- FFmpeg (bundled via `@ffmpeg-installer/ffmpeg`)
-
-## Setup
-
-### 1. Clone and install
-
-```bash
-cd animatube
-npm install
-```
-
-### 2. Configure environment variables
-
-Copy `.env` and fill in all values:
-
-```bash
-cp .env .env.local
-```
-
-Required variables:
-
-| Variable | Description |
-|---|---|
-| `NEXTAUTH_SECRET` | Random secret (run `openssl rand -hex 32`) |
-| `GOOGLE_CLIENT_ID` | Google OAuth client ID |
-| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
-| `GROQ_API_KEY` | Groq API key (free tier) |
-| `PEXELS_API_KEY` | Pexels API key (free tier) |
-| `AWS_ACCESS_KEY_ID` | AWS access key |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
-| `AWS_S3_BUCKET` | S3 bucket name |
-| `AWS_REGION` | S3 region (e.g. `us-east-1`) |
-| `REDIS_URL` | Redis connection URL |
-| `DATABASE_URL` | PostgreSQL connection string |
-| `ENCRYPTION_KEY` | 64-char hex string for AES-256 encryption |
-
-Generate an encryption key:
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-```
-
-### 3. Google OAuth Setup
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com)
-2. Create a new project → Enable **YouTube Data API v3** and **Google+ API**
-3. Create OAuth 2.0 credentials (Web application)
-4. Add authorized redirect URI: `http://localhost:3000/api/auth/callback/google`
-5. Request scopes: `openid`, `email`, `profile`, `youtube.upload`, `youtube`
-
-### 4. Database setup
-
-```bash
-npm run db:push    # Push schema to database
-npm run db:studio  # Optional: open Prisma Studio
-```
-
-### 5. Run the app
-
-You need **two terminal windows**:
-
-**Terminal 1 — Next.js dev server:**
-```bash
-npm run dev
-```
-
-**Terminal 2 — BullMQ worker:**
-```bash
-npm run worker
-```
-
-Open [http://localhost:3000](http://localhost:3000)
-
----
-
-## Architecture
-
-```
-Browser → Next.js API → BullMQ Queue → Worker Process
-                                           ↓
-                                    Stage 1: Groq Script
-                                    Stage 2: Edge TTS
-                                    Stage 3: Pexels/Canvas
-                                    Stage 4: FFmpeg Assembly
-                                    Stage 5: Subtitle Burn-in
-                                    Stage 6: YouTube Upload
-                                           ↓
-                                    SSE → Browser Progress
-```
-
-## Pages
-
-| Route | Description |
-|---|---|
-| `/` | Home — prompt input + advanced options |
-| `/generate/[jobId]` | Real-time progress tracker |
-| `/dashboard` | Video history grid |
-| `/settings` | YouTube connection + preferences |
-
-## API Routes
-
-| Method | Route | Description |
-|---|---|---|
-| POST | `/api/generate` | Create video job |
-| GET | `/api/jobs/[jobId]/sse` | SSE progress stream |
-| GET | `/api/jobs/[jobId]` | Poll job status |
-| GET | `/api/dashboard` | Video history |
-| POST | `/api/reupload/[id]` | Re-upload to YouTube |
-| GET | `/api/download/[id]` | S3 presigned download URL |
-| POST | `/api/settings` | Save preferences |
-
-## Security
-
-- OAuth tokens stored AES-256-GCM encrypted in PostgreSQL
-- API keys only in environment variables, never sent to browser
-- Rate limited: 5 videos/hour per user
-- FFmpeg runs in isolated temp directories, cleaned up after each job
-- S3 intermediate assets expire in 7 days; final MP4s are permanent
-
-## Testing Each Stage
-
-```bash
-# Test script generation
-curl -X POST http://localhost:3000/api/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"How neural networks work","style":"educational","duration":"short","voice":"ai_narrator","language":"english","visibility":"private"}'
-
-# Returns: {"jobId":"job_..."}
-
-# Watch progress
-curl -N http://localhost:3000/api/jobs/job_.../sse
-```
+Cleanup is recorded in the durable JobOutbox before any file is removed and retried by `npm run worker` after interrupted requests or storage failures. Once permanent deletion starts, Restore is disabled. Shared source clips referenced by other projects/profiles remain available and their cleanup is deferred until the last reference is removed; reusable uploaded sources and music are retained. Finish or delete an unfinished translation that still needs the original storyboard first. Credits/credit ledger, existing YouTube publications and downloaded local copies are preserved. Failed cleanup appears in Trash with a retry button.

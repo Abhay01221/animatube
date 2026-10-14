@@ -1,11 +1,12 @@
-// Prisma 7 config — loads DATABASE_URL from .env using an explicit path
-// so it resolves correctly regardless of where the CLI is invoked from.
-import path from "path";
-import { config } from "dotenv";
+// Use the same environment precedence as the web app and worker.
+import { loadEnvConfig } from "@next/env";
 import { defineConfig } from "prisma/config";
 
-// Load .env from the same directory as this config file
-config({ path: path.resolve(__dirname, ".env") });
+// Migrations need a direct/session connection for advisory locking.
+loadEnvConfig(process.cwd(), process.env.NODE_ENV !== "production");
+const migrationUrl = process.env.DIRECT_URL || process.env.DATABASE_URL;
+const url = migrationUrl ? new URL(migrationUrl) : undefined;
+if (url?.hostname.endsWith(".pooler.supabase.com") && url.port === "6543") url.port = "5432";
 
 export default defineConfig({
   schema: "prisma/schema.prisma",
@@ -13,6 +14,6 @@ export default defineConfig({
     path: "prisma/migrations",
   },
   datasource: {
-    url: process.env.DATABASE_URL,
+    url: url?.href,
   },
 });

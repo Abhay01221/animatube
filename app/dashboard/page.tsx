@@ -9,9 +9,9 @@ import { Sparkles, Video, TrendingUp, CheckCircle, XCircle } from "lucide-react"
 import Link from "next/link";
 import { VideoCard } from "@/components/VideoCard";
 import { AuthGuard } from "@/components/auth/AuthGuard";
-import { auth } from "@/lib/firebase";
+import { useAuth } from "@/components/auth/AuthProvider";
 
-type VideoStatus = "all" | "completed" | "failed" | "processing" | "pending";
+type VideoStatus = "all" | "completed" | "failed" | "processing" | "pending" | "trash";
 
 interface VideoItem {
   id: string;
@@ -34,9 +34,12 @@ interface VideoItem {
   uploadError?: string | null;
   errorMessage?: string | null;
   createdAt: string;
+  deletedAt?:string|null;
+  playbackKey?:string;
 }
 
 interface DashboardData {
+  credits?: number;
   videos: VideoItem[];
   stats: {
     total: number;
@@ -53,54 +56,64 @@ interface DashboardData {
 const FILTERS: { value: VideoStatus; label: string }[] = [
   { value: "all", label: "All" },
   { value: "completed", label: "Completed" },
-  { value: "processing", label: "Uploading" },
+  { value: "processing", label: "In progress" },
   { value: "failed", label: "Failed" },
+  { value: "trash", label: "Trash" },
 ];
 
 export default function DashboardPage() {
+  const { user, loading: authLoading } = useAuth();
   const [data, setData] = useState<DashboardData | null>(null);
   const [filter, setFilter] = useState<VideoStatus>("all");
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshKey,setRefreshKey]=useState(0);
+  const viewingTrash=filter==="trash";
 
   useEffect(() => {
+    if (authLoading || !user) return;
+    const controller = new AbortController();
     async function fetchDashboard() {
       try {
-        const user = auth.currentUser;
-        if (!user) return;
-
         // Use cached token
-        const token = await user.getIdToken(false);
-        const res = await fetch("/api/dashboard", {
+        const token = await user!.getIdToken(false);
+        const res = await fetch(`/api/dashboard${viewingTrash?"?trash=1":""}`, {
           headers: {
             "Authorization": `Bearer ${token}`,
           },
+          signal: controller.signal,
         });
 
         if (res.ok) {
           const data = await res.json();
-          setData(data);
-        }
+          if(!controller.signal.aborted){setData(data);setError(null);}
+        } else throw new Error("Unable to load your videos. Please try again.");
       } catch (error) {
-        console.error("[dashboard] Error:", error);
+        if (!controller.signal.aborted) setError(error instanceof Error ? error.message : "Unable to load videos");
       } finally {
-        setLoading(false);
+        if(!controller.signal.aborted)setLoading(false);
       }
     }
 
-    fetchDashboard();
-  }, []);
+    void fetchDashboard();
+    const interval = setInterval(fetchDashboard, 10000);
+    return () => { controller.abort(); clearInterval(interval); };
+  }, [user, authLoading,viewingTrash,refreshKey]);
+
+  function libraryChanged(id:string){setData(current=>current?{...current,videos:current.videos.filter(video=>video.id!==id)}:current);setRefreshKey(key=>key+1);}
+  const visible=(data?.videos??[]).filter(video=>viewingTrash?!!video.deletedAt:!video.deletedAt);
 
   const filtered =
-    filter === "all"
-      ? data?.videos ?? []
-      : (data?.videos ?? []).filter((v) => {
+    filter === "all"||viewingTrash
+      ? visible
+      : visible.filter((v) => {
           if (filter === "completed") {
             return v.renderStatus === "completed" || v.status === "completed";
           }
           if (filter === "failed") {
             return v.renderStatus === "failed" || v.status === "failed";
           }
-          return v.status === filter;
+          return ["pending", "processing", "retrying", "awaiting_approval", "queued"].includes(v.renderStatus ?? v.status) || v.uploadStatus === "uploading";
         });
 
   return (
@@ -131,12 +144,14 @@ export default function DashboardPage() {
       <div className="max-w-6xl mx-auto mt-16">
         {/* Header */}
         <div className="mb-8">
-          <h1 className="text-3xl font-bold text-white mb-1">Dashboard</h1>
-          <p className="text-zinc-500">Your AI-generated video library</p>
+          <h1 className="text-3xl font-bold text-white mb-1">{viewingTrash?"Trash":"Dashboard"}</h1>
+          <p className="text-zinc-500">{viewingTrash?"Restore a video or delete it permanently with its cloud files. Permanent deletion cannot be undone. Shared sources stay while other projects use them.":"Your AI-generated video library"}</p>
+          {typeof data?.credits === "number" && <p className="mt-2 text-sm text-violet-300">{data.credits} credits available · New generation: 1 credit</p>}
+          {error && <p role="alert" className="mt-3 text-red-300">{error}</p>}
         </div>
 
         {/* Stats bar */}
-        {data && (
+        {data && !viewingTrash && (
           <motion.div
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
@@ -182,12 +197,12 @@ export default function DashboardPage() {
               }`}
             >
               {f.label}
-              {data && f.value !== "all" && (
+              {data && !viewingTrash && f.value !== "all" && f.value!=="trash" && (
                 <span className="ml-1.5 text-xs opacity-60">
                   {data.videos.filter((v) => {
                     if (f.value === "completed") return v.renderStatus === "completed" || v.status === "completed";
                     if (f.value === "failed") return v.renderStatus === "failed" || v.status === "failed";
-                    return v.status === f.value;
+                    return ["pending", "processing", "retrying", "awaiting_approval", "queued"].includes(v.renderStatus ?? v.status) || v.uploadStatus === "uploading";
                   }).length}
                 </span>
               )}
@@ -214,7 +229,7 @@ export default function DashboardPage() {
         ) : filtered.length === 0 ? (
           <div className="text-center py-20">
             <Video className="w-12 h-12 text-zinc-700 mx-auto mb-4" />
-            <p className="text-zinc-500 text-lg">No videos yet</p>
+            <p className="text-zinc-500 text-lg">{viewingTrash?"Trash is empty":"No videos yet"}</p>
             <p className="text-zinc-600 text-sm mt-1">
               {filter === "all"
                 ? "Generate your first video to get started"
@@ -238,7 +253,7 @@ export default function DashboardPage() {
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: i * 0.05 }}
               >
-                <VideoCard video={video} />
+                <VideoCard video={video} onChanged={libraryChanged} />
               </motion.div>
             ))}
           </div>

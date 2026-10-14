@@ -25,6 +25,12 @@ function initAdmin() {
     return { app: adminApp, auth: adminAuth };
   }
 
+  if(process.env.FIREBASE_AUTH_EMULATOR_HOST){
+    if(process.env.NODE_ENV==="production")throw new Error("Firebase Auth Emulator cannot be used in production");
+    adminApp=initializeApp({projectId:process.env.FIREBASE_ADMIN_PROJECT_ID||"demo-animatube"});
+    adminAuth=getAuth(adminApp);return {app:adminApp,auth:adminAuth};
+  }
+
   // Initialize with service account credentials
   const privateKey = process.env.FIREBASE_ADMIN_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
@@ -57,7 +63,7 @@ function initAdmin() {
  */
 export async function verifyIdToken(token: string) {
   const { auth } = initAdmin();
-  return auth.verifyIdToken(token);
+  return auth.verifyIdToken(token, true);
 }
 
 /**

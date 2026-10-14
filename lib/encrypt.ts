@@ -10,7 +10,7 @@ const TAG_LENGTH = 16;
 
 function getKey(): Buffer {
   const hex = process.env.ENCRYPTION_KEY;
-  if (!hex || hex.length !== 64) {
+  if (!hex || !/^[a-f0-9]{64}$/i.test(hex)) {
     throw new Error(
       "ENCRYPTION_KEY must be a 64-character hex string (32 bytes)"
     );
@@ -43,6 +43,7 @@ export function encrypt(plaintext: string): string {
 export function decrypt(encoded: string): string {
   const key = getKey();
   const data = Buffer.from(encoded, "base64");
+  if (data.length < IV_LENGTH + TAG_LENGTH) throw new Error("Invalid encrypted token");
 
   const iv = data.subarray(0, IV_LENGTH);
   const tag = data.subarray(IV_LENGTH, IV_LENGTH + TAG_LENGTH);

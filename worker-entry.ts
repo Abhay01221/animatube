@@ -1,40 +1,13 @@
-/**
- * Worker Entry Point
- * 
- * Starts BullMQ workers for video generation.
- * Run this as a separate process from the Next.js frontend.
- * 
- * Usage:
- *   npm run worker
- *   OR
- *   npx tsx worker-entry.ts
- */
-import { createWorker } from "./lib/worker";
-
-console.log("========================================");
-console.log("🚀 Animatube Worker Starting");
-console.log("========================================");
-console.log(`Node.js version: ${process.version}`);
-console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
-console.log(`Redis URL: ${process.env.REDIS_URL?.replace(/:\/\/.*@/, "://<credentials>@")}`);
-console.log(`Database: ${process.env.DATABASE_URL?.split("@")[1] || "not configured"}`);
-console.log(`S3 Bucket: ${process.env.AWS_S3_BUCKET || "not configured"}`);
-console.log("========================================\n");
-
-// Create and start worker
-const worker = createWorker();
-
-// Graceful shutdown
-process.on("SIGTERM", async () => {
-  console.log("\n⚠️  SIGTERM received, shutting down gracefully...");
-  await worker.close();
-  process.exit(0);
-});
-
-process.on("SIGINT", async () => {
-  console.log("\n⚠️  SIGINT received, shutting down gracefully...");
-  await worker.close();
-  process.exit(0);
-});
-
-console.log("✅ Worker is running and waiting for jobs...\n");
+import { loadEnvConfig } from "@next/env";
+loadEnvConfig(process.cwd());
+async function main(){
+  const [{createVideoWorker},{createUploadWorker},{dispatchOutbox},{closeQueues},{prisma},{reconcileInterruptedJobs}]=await Promise.all([import("./lib/workers/video-worker"),import("./lib/workers/upload-worker"),import("./lib/generation/outbox"),import("./lib/queue"),import("./lib/prisma"),import("./lib/generation/reconcile")]);
+  const render=createVideoWorker();const upload=createUploadWorker();
+  let dispatching=false;let stopping=false;
+  const dispatch=async()=>{if(dispatching||stopping)return;dispatching=true;try{await dispatchOutbox();await reconcileInterruptedJobs();}catch(error){console.error("[Outbox] Dispatch unavailable",error instanceof Error?error.name:"UnknownError");}finally{dispatching=false;}};
+  const timer=setInterval(()=>void dispatch(),5000);void dispatch();
+  const shutdown=async()=>{if(stopping)return;stopping=true;clearInterval(timer);await Promise.all([render.close(),upload.close()]);await closeQueues();await prisma.$disconnect();process.exit(0);};
+  process.once("SIGTERM",()=>void shutdown());process.once("SIGINT",()=>void shutdown());
+  console.log("Animatube rendering, publishing, and durable outbox workers started.");
+}
+void main().catch(error=>{console.error("Worker startup failed",error instanceof Error?error.message:"UnknownError");process.exitCode=1;});

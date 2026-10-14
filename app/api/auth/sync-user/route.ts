@@ -7,6 +7,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyIdToken } from "@/lib/firebase-admin";
 import { prisma } from "@/lib/prisma";
+import { canLinkLegacyAccount } from "@/lib/account-linking";
 
 export async function POST(req: NextRequest) {
   try {
@@ -42,25 +43,51 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Upsert user in Prisma database
-    const user = await prisma.user.upsert({
-      where: { firebaseUid: uid },
-      update: {
-        email,
-        name: name || null,
-        image: picture || null,
-      },
-      create: {
-        firebaseUid: uid,
-        email,
-        name: name || null,
-        image: picture || null,
-        credits: 5, // Default starting credits
-        videosGenerated: 0,
-      },
-    });
+    if (!decoded.email_verified) {
+      return NextResponse.json({ error: "Verify your email address before using Animatube." }, { status: 403 });
+    }
 
-    console.log("[sync-user] User synced:", user.email);
+    // Match Firebase UID first. Older users may have been created before
+    // Firebase sync was added and therefore only have an email on the row.
+    // Looking up by email prevents the create branch from violating User.email
+    // when that user signs in with Google for the first time.
+    const existingByUid = await prisma.user.findUnique({
+      where: { firebaseUid: uid },
+    });
+    const existingByEmail = existingByUid
+      ? null
+      : await prisma.user.findUnique({ where: { email }, include: { accounts: { where: { provider: "google" }, select: { providerAccountId: true } } } });
+
+    if (existingByEmail && !canLinkLegacyAccount({
+      emailVerified: decoded.email_verified === true, uid, existingUid: existingByEmail.firebaseUid,
+      googleIdentity: decoded.firebase?.identities?.["google.com"]?.[0],
+      legacyGoogleIdentities: [existingByEmail.googleId, ...existingByEmail.accounts.map(account => account.providerAccountId)].filter((id): id is string => !!id),
+    })) {
+      return NextResponse.json({ error: "This email belongs to a different linked account. Sign in using its original provider." }, { status: 409 });
+    }
+
+    const user = existingByUid || existingByEmail
+      ? await prisma.user.update({
+          where: { id: (existingByUid || existingByEmail)!.id },
+          data: {
+            firebaseUid: uid,
+            email,
+            emailVerified: new Date(),
+            name: name || (existingByUid || existingByEmail)!.name || null,
+            image: picture || (existingByUid || existingByEmail)!.image || null,
+          },
+        })
+      : await prisma.user.create({
+          data: {
+            firebaseUid: uid,
+            email,
+            emailVerified: new Date(),
+            name: name || null,
+            image: picture || null,
+            credits: 5,
+            videosGenerated: 0,
+          },
+        });
 
     return NextResponse.json({
       success: true,
@@ -74,7 +101,7 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (error) {
-    console.error("[sync-user] Error:", error);
+    console.error("[sync-user] Error:", error instanceof Error ? error.name : "UnknownError");
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 }

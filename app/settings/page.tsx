@@ -13,6 +13,7 @@ import {
   LogOut,
 } from "lucide-react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   Select,
   SelectContent,
@@ -24,6 +25,8 @@ import { toast } from "sonner";
 import { auth } from "@/lib/firebase";
 import { signOut } from "firebase/auth";
 import { AuthGuard } from "@/components/auth/AuthGuard";
+import { useAuth } from "@/components/auth/AuthProvider";
+import { ChannelProfiles } from "@/components/ChannelProfiles";
 
 interface UserSettings {
   defaultVoice?: string;
@@ -38,26 +41,25 @@ interface SettingsData {
   email?: string;
   name?: string;
   image?: string;
+  credits?: number;
 }
 
 export default function SettingsPage() {
+  const router = useRouter();
+  const { user, loading: authLoading } = useAuth();
   const [data, setData] = useState<SettingsData | null>(null);
   const [settings, setSettings] = useState<UserSettings>({});
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [connecting, setConnecting] = useState(false);
 
   useEffect(() => {
+    if (authLoading || !user) return;
+    let active = true;
     async function loadSettings() {
       try {
-        const user = auth.currentUser;
-        if (!user) {
-          toast.error("Not authenticated");
-          setLoading(false);
-          return;
-        }
-
         // Use cached token
-        const token = await user.getIdToken(false);
+        const token = await user!.getIdToken(false);
         const res = await fetch("/api/settings", {
           headers: {
             "Authorization": `Bearer ${token}`,
@@ -67,17 +69,34 @@ export default function SettingsPage() {
         if (!res.ok) throw new Error("Failed to load");
         
         const d: SettingsData = await res.json();
-        setData(d);
-        setSettings(d.settings ?? {});
-      } catch (error) {
-        toast.error("Failed to load settings");
+        if (active) { setData(d); setSettings(d.settings ?? {}); }
+      } catch {
+        if (active) toast.error("Failed to load settings");
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
       }
     }
 
-    loadSettings();
-  }, []);
+    void loadSettings();
+    return () => { active = false; };
+  }, [user, authLoading]);
+
+  async function handleYouTube(disconnect = false) {
+    if (!user || connecting) return;
+    setConnecting(true);
+    try {
+      const token = await user.getIdToken();
+      const response = await fetch(disconnect ? "/api/youtube/disconnect" : "/api/youtube/connect", {
+        method: disconnect ? "DELETE" : "POST", headers: { Authorization: `Bearer ${token}` },
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? "YouTube connection failed");
+      if (disconnect) { setData((previous) => previous ? { ...previous, youtubeConnected: false } : previous); toast.success("YouTube disconnected"); }
+      else if (typeof result.url === "string") { window.location.assign(result.url); }
+      else throw new Error("Authorization URL was missing");
+    } catch (error) { toast.error(error instanceof Error ? error.message : "YouTube connection failed"); }
+    finally { setConnecting(false); }
+  }
 
   async function handleSave() {
     setSaving(true);
@@ -110,8 +129,8 @@ export default function SettingsPage() {
   async function handleSignOut() {
     try {
       await signOut(auth);
-      window.location.href = "/sign-in";
-    } catch (error) {
+      router.push("/sign-in");
+    } catch {
       toast.error("Failed to sign out");
     }
   }
@@ -120,7 +139,7 @@ export default function SettingsPage() {
     setSettings((prev) => ({ ...prev, [key]: value }));
   }
 
-  if (loading) {
+  if (loading && user || authLoading) {
     return (
       <main className="min-h-screen flex items-center justify-center">
         <div className="w-8 h-8 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
@@ -171,16 +190,10 @@ export default function SettingsPage() {
                 Account
               </h2>
               <div className="flex items-center gap-4">
-                {data.image && (
-                  <img
-                    src={data.image}
-                    alt={data.name ?? ""}
-                    className="w-12 h-12 rounded-full"
-                  />
-                )}
                 <div>
                   <p className="text-zinc-200 font-medium">{data.name}</p>
                   <p className="text-zinc-500 text-sm">{data.email}</p>
+                  <p className="text-violet-300 text-sm">{data.credits ?? "—"} credits available</p>
                 </div>
                 <button
                   onClick={handleSignOut}
@@ -219,23 +232,24 @@ export default function SettingsPage() {
                 <div className="flex items-center gap-2">
                   <CheckCircle className="w-4 h-4 text-emerald-400" />
                   <span className="text-emerald-400 text-sm">Connected</span>
+                  <button disabled={connecting} onClick={() => handleYouTube(true)} className="text-xs text-zinc-400 underline disabled:opacity-50">Disconnect</button>
                 </div>
               ) : (
                 <div className="flex items-center gap-3">
                   <XCircle className="w-4 h-4 text-red-400" />
-                  <a
-                    href="/api/auth/signin"
+                  <button
+                    onClick={() => handleYouTube()}
+                    disabled={connecting}
                     className="text-sm px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white rounded-md transition-colors duration-300"
                   >
-                    Connect
-                  </a>
+                    {connecting ? "Connecting…" : "Connect"}
+                  </button>
                 </div>
               )}
             </div>
             {!data?.youtubeConnected && (
               <p className="mt-3 text-xs text-zinc-600 bg-zinc-900 rounded-lg p-3">
-                Sign in with Google and grant YouTube permissions to enable
-                automatic uploads. Your OAuth tokens are stored encrypted.
+                Connect a YouTube channel separately to authorize uploads. Video generation works without a connected channel.
               </p>
             )}
           </motion.section>
@@ -340,6 +354,7 @@ export default function SettingsPage() {
             </button>
           </motion.section>
 
+          <ChannelProfiles/>
           {/* API Info */}
           <motion.section
             initial={{ opacity: 0, y: 12 }}

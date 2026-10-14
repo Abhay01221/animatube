@@ -12,7 +12,7 @@ import type {
 
 // ─── Style Templates ──────────────────────────────────────────────────────────
 
-const ANIME_STYLE_BASE = `MAPPA-inspired anime style, dark fantasy aesthetic, highly detailed anime art, cinematic composition, movie-quality animation frame`;
+const DEFAULT_VISUAL_STYLE = "natural documentary visuals, clear composition, realistic lighting";
 
 const LIGHTING_PRESETS: Record<string, string> = {
   dark: "dramatic shadows, low-key lighting, rim lighting, deep blacks, high contrast",
@@ -76,7 +76,8 @@ export function enhanceCinematicPrompt(
   cameraDirection: string,
   lighting: string,
   shotType?: ShotType,
-  characters?: CharacterDescription[]
+  characters?: CharacterDescription[],
+  visualStyle = DEFAULT_VISUAL_STYLE,
 ): CinematicPromptEnhancement {
   // Build character consistency injection
   let characterPrompt = "";
@@ -108,18 +109,13 @@ export function enhanceCinematicPrompt(
     ? `${shotType} framing, professional cinematography,`
     : "cinematic framing,";
 
-  // Construct enhanced prompt
-  const enhancedPrompt = `${ANIME_STYLE_BASE}, ${shotDescription} ${basePrompt}${
-    characterPrompt ? `, featuring ${characterPrompt}` : ""
-  }, ${lightingDetails}, ${cameraMovement}, ${atmosphere}, ${colorGrading}, detailed anime eyes, atmospheric fog, movie-quality composition, 4K anime wallpaper quality, trending on ArtStation, professional anime production`;
-
   return {
-    base_prompt: basePrompt,
+    base_prompt: `${shotDescription} ${basePrompt}${characterPrompt ? `, featuring ${characterPrompt}` : ""}`,
     lighting: lightingDetails,
     camera_movement: cameraMovement,
     atmosphere,
     color_grading: colorGrading,
-    style_enforcement: ANIME_STYLE_BASE,
+    style_enforcement: visualStyle,
     motion_details: cameraMovement,
   };
 }
@@ -134,7 +130,8 @@ export function generateScenePrompt(
   cameraDirection: string,
   lighting: string,
   shotType?: ShotType,
-  characters?: CharacterDescription[]
+  characters?: CharacterDescription[],
+  visualStyle = DEFAULT_VISUAL_STYLE,
 ): string {
   const basePrompt = `${visualCue} in ${environment}`;
   const enhancement = enhanceCinematicPrompt(
@@ -143,13 +140,14 @@ export function generateScenePrompt(
     cameraDirection,
     lighting,
     shotType,
-    characters
+    characters,
+    visualStyle,
   );
 
-  return enhancement.style_enforcement + ", " + basePrompt + ", " +
+  return enhancement.style_enforcement + ", " + enhancement.base_prompt + ", " +
     enhancement.lighting + ", " + enhancement.camera_movement + ", " +
     enhancement.atmosphere + ", " + enhancement.color_grading +
-    ", detailed anime eyes, atmospheric depth, cinematic composition";
+    ", clear subject framing, cinematic composition";
 }
 
 /**

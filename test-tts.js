@@ -1,8 +1,5 @@
-const { MsEdgeTTS, OUTPUT_FORMAT } = require("msedge-tts");
-const path = require("path");
-const fs = require("fs");
-
 async function test() {
+  const [{MsEdgeTTS,OUTPUT_FORMAT},path,fs]=await Promise.all([import("msedge-tts"),import("node:path"),import("node:fs")]);
   try {
     const tts = new MsEdgeTTS();
 
@@ -12,7 +9,7 @@ async function test() {
     );
 
     // Create output directory
-    const outputDir = path.join(__dirname, "test-output");
+    const outputDir = path.join(process.cwd(), "test-output");
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
     }

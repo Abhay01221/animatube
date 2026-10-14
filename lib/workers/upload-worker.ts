@@ -1,131 +1,41 @@
-/**
- * YouTube Upload Worker (Job D)
- * 
- * Completely independent from video rendering.
- * Handles YouTube upload with retry logic.
- * 
- * NEVER modifies renderStatus or project completion state.
- * Only updates uploadStatus.
- */
-import { Worker, Job } from "bullmq";
+import { Worker,UnrecoverableError, type Job } from "bullmq";
 import { UPLOAD_QUEUE_NAME, type UploadJobData } from "../queue";
 import { createRedisConnection } from "../redis";
 import { prisma } from "../prisma";
+import { assetFromVideo, verifyAsset } from "../assets";
 import { uploadToYouTube } from "../stages/upload";
-import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
 
-// ─── Main upload processor ────────────────────────────────────────────────────
-async function processUploadJob(job: Job<UploadJobData>): Promise<void> {
-  const { jobId, userId, localFilePath, title, description, tags, visibility } = job.data;
-
-  console.log(`\n========================================`);
-  console.log(`[UploadWorker] Starting YouTube upload for job ${jobId}`);
-  console.log(`[UploadWorker] User: ${userId}`);
-  console.log(`[UploadWorker] Title: ${title}`);
-  console.log(`[UploadWorker] Local file: ${localFilePath}`);
-  console.log(`========================================\n`);
-
+export async function processUploadJob(job: Pick<Job<UploadJobData>,"data"|"attemptsMade"|"opts">,upload:typeof uploadToYouTube=uploadToYouTube): Promise<void> {
+  const { jobId, userId, title, description, tags, visibility } = job.data;
   try {
-    // Update upload status to uploading
-    await prisma.video.update({
-      where: { jobId },
-      data: { uploadStatus: "uploading" },
-    });
-
-    // Verify local file exists
-    if (!fs.existsSync(localFilePath)) {
-      throw new Error(`Local file not found: ${localFilePath}`);
+    const video = await prisma.video.findFirst({ where: { jobId, userId } });
+    if (!video) return; // Permanent deletion can leave an old queue delivery behind.
+    if(video.deletedAt)return;
+    if(job.data.renderRevision!==undefined&&job.data.renderRevision!==video.renderRevision)throw new UnrecoverableError("The publishing request belongs to an older render revision");
+    if (video.renderStatus !== "completed") throw new Error("Rendering must complete before publishing");
+    if (video.youtubeId) {
+      await prisma.video.update({ where: { jobId }, data: { uploadStatus: "uploaded", uploadError: null } });
+      return;
     }
-
-    // Create temp directory for upload process
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `animatube-upload-${jobId}-`));
-
-    try {
-      // Copy file to temp directory (upload stage expects it there)
-      const tmpFilePath = path.join(tmpDir, "final_video.mp4");
-      fs.copyFileSync(localFilePath, tmpFilePath);
-
-      // Upload to YouTube
-      console.log(`[UploadWorker] Uploading to YouTube...`);
-      const { youtubeId, youtubeUrl } = await uploadToYouTube(
-        jobId,
-        userId,
-        localFilePath, // Pass local file path directly
-        title,
-        description,
-        tags,
-        visibility,
-        tmpDir,
-        (log) => console.log(`[UploadWorker] ${log}`)
-      );
-
-      // Update database with YouTube info
-      await prisma.video.update({
-        where: { jobId },
-        data: {
-          uploadStatus: "uploaded",
-          youtubeId,
-          youtubeUrl,
-          uploadError: null, // Clear any previous error
-        },
-      });
-
-      console.log(`[UploadWorker] Upload successful!`);
-      console.log(`[UploadWorker] YouTube URL: ${youtubeUrl}`);
-
-    } finally {
-      // Clean up temp directory
-      try {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      } catch {
-        // Non-fatal
-      }
+    const asset = assetFromVideo(video);
+    if (!asset || !(await verifyAsset(asset))) throw new Error("The approved rendered video is unavailable");
+    if (job.data.asset && (job.data.asset.provider !== asset.provider || job.data.asset.key !== asset.key)) {
+      throw new Error("Queued video asset changed. Retry publishing the current approved video.");
     }
-
-  } catch (err) {
-    const errorMessage = (err as Error).message;
-    console.error(`[UploadWorker] Upload failed for job ${jobId}:`, err);
-
-    // Update upload status to failed
-    // IMPORTANT: Do NOT touch renderStatus or project completion
-    await prisma.video.update({
-      where: { jobId },
-      data: {
-        uploadStatus: "failed",
-        uploadError: errorMessage,
-      },
-    });
-
-    // Log the error but don't throw (we don't want BullMQ to retry automatically)
-    // User can manually retry from UI
-    console.log(`[UploadWorker] Upload marked as failed. User can retry from dashboard.`);
+    await prisma.video.update({ where: { jobId }, data: { uploadStatus: "uploading", uploadError: null } });
+    await upload(jobId, userId, asset, title, description, tags, visibility, "", undefined, job.data.language || video.language);
+  } catch (error) {
+    const willRetry = !(error instanceof UnrecoverableError)&&job.attemptsMade + 1 < (job.opts.attempts || 1);
+    await prisma.video.updateMany({ where: { jobId, userId,...(job.data.renderRevision!==undefined?{renderRevision:job.data.renderRevision}:{}) }, data: {
+      uploadStatus: willRetry ? "retrying" : "failed", uploadError: error instanceof Error ? error.message : "Publishing failed",
+    } });
+    // Throwing is required for BullMQ backoff/attempts to execute.
+    throw error;
   }
 }
-
-// ─── Worker instance ──────────────────────────────────────────────────────────
 export function createUploadWorker() {
-  const worker = new Worker<UploadJobData>(
-    UPLOAD_QUEUE_NAME,
-    processUploadJob,
-    {
-      connection: createRedisConnection(),
-      concurrency: 3, // Can handle multiple uploads in parallel
-    }
-  );
-
-  worker.on("completed", (job) => {
-    console.log(`[UploadWorker] Job ${job.id} completed`);
-  });
-
-  worker.on("failed", (job, err) => {
-    console.error(`[UploadWorker] Job ${job?.id} failed:`, err.message);
-  });
-
-  worker.on("error", (err) => {
-    console.error("[UploadWorker] Worker error:", err);
-  });
-
+  const worker = new Worker<UploadJobData>(UPLOAD_QUEUE_NAME, job=>processUploadJob(job), { connection: createRedisConnection(), concurrency: 2 });
+  worker.on("failed", (job, error) => console.error(`[UploadWorker] Job ${job?.id} failed: ${error.message}`));
+  worker.on("error", error => console.error("[UploadWorker] Connection error", error.message));
   return worker;
 }

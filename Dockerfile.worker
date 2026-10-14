@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     python3 \
     make \
     g++ \
+    fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory

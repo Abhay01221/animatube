@@ -1,168 +1,23 @@
 "use client";
 
-/**
- * Animated stage tracker for the progress page.
- * Shows 6 stages with icons, labels, status, and live log lines.
- */
-import { motion, AnimatePresence } from "framer-motion";
-import {
-  FileText,
-  Mic,
-  Film,
-  Scissors,
-  Subtitles,
-  Upload,
-  Check,
-  X,
-  Loader2,
-} from "lucide-react";
-import type { StageUpdate } from "@/lib/worker";
+import { Check, Circle, Loader2, X } from "lucide-react";
+import type { ProgressStage } from "./generation-state";
 
-const STAGE_ICONS = [FileText, Mic, Film, Scissors, Subtitles, Upload];
+const LABELS = ["Script and storyboard", "Voiceover", "Visuals", "Assembly", "Captions", "Final storage"];
 
-const STAGE_LABELS = [
-  "Writing script",
-  "Generating voiceover",
-  "Fetching visuals",
-  "Assembling video",
-  "Adding subtitles",
-  "Uploading to YouTube",
-];
-
-interface StageTrackerProps {
-  stages: StageUpdate[];
-}
-
-export function StageTracker({ stages }: StageTrackerProps) {
-  // Build a map of stage number → latest update
-  const stageMap = new Map<number, StageUpdate>();
-  for (const update of stages) {
-    if (update.stage >= 1 && update.stage <= 6) {
-      stageMap.set(update.stage, update);
-    }
-  }
-
-  return (
-    <div className="w-full max-w-lg mx-auto space-y-3">
-      {STAGE_LABELS.map((label, i) => {
-        const stageNum = i + 1;
-        const update = stageMap.get(stageNum);
-        const status = update?.status ?? "pending";
-        const log = update?.log;
-        const Icon = STAGE_ICONS[i];
-
-        return (
-          <motion.div
-            key={stageNum}
-            initial={{ opacity: 0, x: -20 }}
-            animate={{ opacity: 1, x: 0 }}
-            transition={{ delay: i * 0.05 }}
-            className={`relative flex items-start gap-4 p-4 rounded-xl border transition-all duration-300 ${
-              status === "active"
-                ? "border-violet-500/50 bg-violet-950/20 shadow-[0_0_20px_rgba(124,58,237,0.15)]"
-                : status === "done"
-                ? "border-[#1f1f1f] bg-[#111111]/50"
-                : status === "error"
-                ? "border-red-500/50 bg-red-950/20"
-                : "border-[#1f1f1f] bg-[#111111]/30 opacity-50"
-            }`}
-          >
-            {/* Icon */}
-            <div
-              className={`flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center transition-all duration-300 ${
-                status === "active"
-                  ? "bg-violet-600 text-white"
-                  : status === "done"
-                  ? "bg-emerald-600/20 text-emerald-400"
-                  : status === "error"
-                  ? "bg-red-600/20 text-red-400"
-                  : "bg-zinc-800 text-zinc-600"
-              }`}
-            >
-              {status === "active" ? (
-                <motion.div
-                  animate={{ rotate: 360 }}
-                  transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
-                >
-                  <Loader2 className="w-5 h-5" />
-                </motion.div>
-              ) : status === "done" ? (
-                <Check className="w-5 h-5" />
-              ) : status === "error" ? (
-                <X className="w-5 h-5" />
-              ) : (
-                <Icon className="w-5 h-5" />
-              )}
-            </div>
-
-            {/* Content */}
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center justify-between gap-2">
-                <span
-                  className={`text-sm font-medium ${
-                    status === "active"
-                      ? "text-violet-300"
-                      : status === "done"
-                      ? "text-zinc-300"
-                      : status === "error"
-                      ? "text-red-300"
-                      : "text-zinc-600"
-                  }`}
-                >
-                  {label}
-                </span>
-                <StatusBadge status={status} />
-              </div>
-
-              {/* Live log line */}
-              <AnimatePresence mode="wait">
-                {log && (
-                  <motion.p
-                    key={log}
-                    initial={{ opacity: 0, y: 4 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0 }}
-                    className={`mt-1 text-xs truncate ${
-                      status === "error" ? "text-red-400" : "text-zinc-500"
-                    }`}
-                  >
-                    {log}
-                  </motion.p>
-                )}
-              </AnimatePresence>
-            </div>
-
-            {/* Active pulse ring */}
-            {status === "active" && (
-              <motion.div
-                className="absolute inset-0 rounded-xl border border-violet-500/30"
-                animate={{ opacity: [0.3, 0.8, 0.3] }}
-                transition={{ duration: 2, repeat: Infinity }}
-              />
-            )}
-          </motion.div>
-        );
-      })}
-    </div>
-  );
-}
-
-function StatusBadge({ status }: { status: string }) {
-  const config = {
-    pending: { label: "Pending", className: "text-zinc-600 bg-zinc-800" },
-    active: {
-      label: "Processing",
-      className: "text-violet-300 bg-violet-900/50",
-    },
-    done: { label: "Done", className: "text-emerald-400 bg-emerald-900/30" },
-    error: { label: "Error", className: "text-red-400 bg-red-900/30" },
-  }[status] ?? { label: status, className: "text-zinc-500 bg-zinc-800" };
-
-  return (
-    <span
-      className={`text-xs px-2 py-0.5 rounded-full font-medium ${config.className}`}
-    >
-      {config.label}
-    </span>
-  );
+export function StageTracker({ stages }: { stages: ProgressStage[] }) {
+  const map = new Map(stages.map((stage) => [stage.stage, stage]));
+  return <ol aria-label="Generation stages" className="space-y-3">
+    {LABELS.map((label, index) => {
+      const update = map.get(index + 1);
+      const status = update?.status ?? "pending";
+      const done = ["done", "completed"].includes(status);
+      const active = ["active", "running", "processing", "retrying"].includes(status);
+      const failed = ["error", "failed"].includes(status);
+      return <li key={label} className={`flex items-start gap-3 rounded-xl border p-4 ${failed ? "border-red-900 bg-red-950/20" : active ? "border-violet-700 bg-violet-950/20" : "border-zinc-800 bg-zinc-900/50"}`}>
+        {done ? <Check className="mt-0.5 size-5 shrink-0 text-emerald-400" /> : active ? <Loader2 className="mt-0.5 size-5 shrink-0 animate-spin text-violet-300" /> : failed ? <X className="mt-0.5 size-5 shrink-0 text-red-300" /> : <Circle className="mt-0.5 size-5 shrink-0 text-zinc-600" />}
+        <div className="min-w-0 flex-1"><div className="flex flex-wrap justify-between gap-2 text-sm"><span className="text-zinc-200">{label}</span><span className="text-xs text-zinc-400">{done ? "Saved" : status === "active" ? "Processing" : status}</span></div>{update?.log && <p className="mt-1 break-words text-xs text-zinc-400">{update.log}</p>}</div>
+      </li>;
+    })}
+  </ol>;
 }

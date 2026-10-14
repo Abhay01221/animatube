@@ -7,7 +7,6 @@
 import axios from "axios";
 import * as fs from "fs";
 import * as path from "path";
-import * as os from "os";
 import { createCanvas } from "canvas";
 import { uploadToS3, uploadFileToS3 } from "../s3";
 import type { ScriptSegment } from "./script";

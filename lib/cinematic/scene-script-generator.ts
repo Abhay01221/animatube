@@ -4,11 +4,12 @@
  * Maintains duration awareness and emotional pacing.
  */
 import Groq from "groq-sdk";
+import { withGroqRateLimitRetry } from "../groq-retry";
 import type { StoryPlan, CinematicScene, CharacterDescription } from "../types/cinematic";
 import { getEmotionalPacing } from "./story-planner";
-import { generateScenePrompt } from "./prompt-enhancer";
+import { sceneScriptSchema } from "./schemas";
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY?.trim() });
+
 
 export interface SceneScriptOutput {
   title: string;
@@ -25,9 +26,10 @@ export async function generateSceneScript(
   language: string,
   onLog?: (msg: string) => void
 ): Promise<SceneScriptOutput> {
+  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY?.trim(), timeout: 90_000, maxRetries: 0 });
   onLog?.(`Generating scene-by-scene script based on story plan`);
 
-  const systemPrompt = `You are an expert anime scriptwriter specializing in cinematic storytelling. You write engaging, emotionally resonant scripts with perfect pacing.
+  const systemPrompt = `You are an expert video scriptwriter specializing in cinematic storytelling. You write engaging, emotionally resonant scripts with perfect pacing.
 
 You will receive a STORY PLAN with scene-by-scene emotional beats and timing. Your job is to write the actual narration for each scene.
 
@@ -46,7 +48,8 @@ Output ONLY valid JSON in this exact structure:
       "camera_direction": "string (from story plan)",
       "visual_prompt": "string (what to show visually)",
       "transition_type": "cut|fade|fade through fog|dissolve|wipe|blur transition|light flash|particle dissolve",
-      "soundtrack_mood": "string (audio mood)"
+      "soundtrack_mood": "gentle emotional|calm meditation|epic cinematic|soft piano orchestral|dark ambient drones|percussion heavy orchestral|japanese flute ambience|mysterious whispers|heartbeat tension|action intense",
+      "source_references": [{"sourceId":"ID from approved reference material","passage":"exact supporting passage copied from that source"}]
     }
   ],
   "characters": [
@@ -64,6 +67,7 @@ Output ONLY valid JSON in this exact structure:
 }
 
 CRITICAL NARRATION RULES:
+- source_references must be empty when no approved sources are supplied. Otherwise use only supplied source IDs and exact supporting passages. Leave unsupported claims unreferenced for human review.
 - Each scene's narration must fill its duration_seconds when spoken
 - Use emotional pacing: slower for dramatic scenes (~2.2 wps), faster for action (~2.8 wps)
 - Write 2-4 complete, engaging sentences per scene
@@ -74,7 +78,7 @@ CRITICAL NARRATION RULES:
 
 VISUAL PROMPT RULES:
 - Describe what should be shown on screen
-- Be specific about anime visual style
+- Use only the visual style specified in the story plan; keep content format separate
 - Include character actions and expressions
 - Describe environment details
 - Match visual mood to emotion
@@ -82,7 +86,7 @@ VISUAL PROMPT RULES:
 CHARACTER CONSISTENCY:
 - If characters appear, define them in the characters array
 - Use consistent descriptions across all scenes
-- Include anime-specific details (eye style, hair color, outfit)`;
+- Describe factual visual references for documentary and educational content; only describe fictional characters where requested`;
 
   const scenePlansText = storyPlan.scenes
     .map(
@@ -108,91 +112,73 @@ Write engaging narration for each scene that:
 4. Uses cinematic, engaging language
 5. Maintains consistent character descriptions if applicable`;
 
-  // Retry logic for rate limits
-  let lastError: Error | null = null;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const completion = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        response_format: { type: "json_object" },
-        max_tokens: 4500,
-        temperature: 0.7,
-      });
+  const completion = await withGroqRateLimitRetry(() => groq.chat.completions.create({
+    model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    response_format: { type: "json_object" },
+    max_tokens: 4500,
+    temperature: 0.7,
+  }), onLog);
 
-      const rawContent = completion.choices[0].message.content;
-      if (!rawContent) throw new Error("Scene script generator returned empty response");
+  const rawContent = completion.choices[0].message.content;
+  if (!rawContent) throw new Error("Scene script generator returned empty response");
 
-      let scriptOutput: SceneScriptOutput;
-      try {
-        scriptOutput = JSON.parse(rawContent);
-      } catch {
-        throw new Error(`Scene script generator returned invalid JSON: ${rawContent.slice(0, 200)}`);
-      }
+  let scriptOutput: SceneScriptOutput;
+  try {
+    scriptOutput = sceneScriptSchema.parse(JSON.parse(rawContent));
+  } catch {
+    throw new Error("Scene script generator returned invalid structured output");
+  }
 
-      // Validate and enhance scenes
-      if (!scriptOutput.scenes || scriptOutput.scenes.length === 0) {
-        throw new Error("Script output missing scenes");
-      }
+  // Validate and enhance scenes
+  if (!scriptOutput.scenes || scriptOutput.scenes.length === 0) {
+    throw new Error("Script output missing scenes");
+  }
 
-      // Validate narration duration for each scene
-      for (let i = 0; i < scriptOutput.scenes.length; i++) {
-        const scene = scriptOutput.scenes[i];
-        const planScene = storyPlan.scenes[i];
+  if (scriptOutput.scenes.length !== storyPlan.scenes.length) throw new Error("Script scene count does not match the approved story plan");
 
-        // Ensure scene has required fields from plan
-        scene.emotion = (scene.emotion || planScene.emotion) as any;
-        scene.camera_direction = (scene.camera_direction || planScene.camera) as any;
-        scene.duration_seconds = scene.duration_seconds || planScene.duration_seconds;
+  // Validate narration duration for each scene
+  for (let i = 0; i < scriptOutput.scenes.length; i++) {
+    const scene = scriptOutput.scenes[i];
+    const planScene = storyPlan.scenes[i];
 
-        // Validate narration length
-        const wordCount = scene.narration.split(/\s+/).length;
-        const expectedWPS = getEmotionalPacing(scene.emotion, planScene.narrative_beat);
-        const estimatedDuration = wordCount / expectedWPS;
-        const targetDuration = scene.duration_seconds;
+    // Ensure scene has required fields from plan
+    scene.emotion = scene.emotion || planScene.emotion;
+    scene.camera_direction = scene.camera_direction || "static";
+    scene.duration_seconds = scene.duration_seconds || planScene.duration_seconds;
 
-        if (Math.abs(estimatedDuration - targetDuration) > targetDuration * 0.3) {
-          onLog?.(
-            `⚠ Scene ${scene.scene_id}: narration mismatch (${estimatedDuration.toFixed(1)}s vs ${targetDuration}s)`
-          );
-          
-          // Adjust duration to match actual narration
-          scene.duration_seconds = Math.round(estimatedDuration);
-        }
-      }
+    // Validate narration length
+    const wordCount = scene.narration.split(/\s+/).length;
+    const expectedWPS = getEmotionalPacing(scene.emotion, planScene.narrative_beat);
+    const estimatedDuration = wordCount / expectedWPS;
+    const targetDuration = scene.duration_seconds;
 
-      // Calculate total duration
-      const totalDuration = scriptOutput.scenes.reduce(
-        (sum, scene) => sum + scene.duration_seconds,
-        0
-      );
-
+    if (Math.abs(estimatedDuration - targetDuration) > targetDuration * 0.3) {
       onLog?.(
-        `✓ Script generated: ${scriptOutput.scenes.length} scenes, ${totalDuration}s total, "${scriptOutput.title}"`
+        `⚠ Scene ${scene.scene_id}: narration mismatch (${estimatedDuration.toFixed(1)}s vs ${targetDuration}s)`
       );
-
-      return scriptOutput;
-    } catch (err: any) {
-      lastError = err;
       
-      // Check if it's a rate limit error
-      if (err.message?.includes("Rate limit") || err.status === 429) {
-        const waitTime = Math.pow(2, attempt) * 1000; // Exponential backoff: 2s, 4s, 8s
-        onLog?.(`⚠ Rate limit hit, waiting ${waitTime / 1000}s before retry ${attempt}/3...`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        continue;
-      }
-      
-      // If not a rate limit error, throw immediately
-      throw err;
+      // Adjust duration to match actual narration
+      // Actual TTS scene measurements determine playback and captions later.
+      scene.duration_seconds = planScene.duration_seconds;
     }
   }
 
-  // All retries failed
-  throw new Error(`Scene script generation failed after 3 attempts: ${lastError?.message}`);
+  // Calculate total duration
+  const totalDuration = scriptOutput.scenes.reduce(
+    (sum, scene) => sum + scene.duration_seconds,
+    0
+  );
+
+  onLog?.(
+    `✓ Script generated: ${scriptOutput.scenes.length} scenes, ${totalDuration}s total, "${scriptOutput.title}"`
+  );
+
+  return scriptOutput;
+
 }
 
 /**

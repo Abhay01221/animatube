@@ -1,375 +1,86 @@
-/**
- * Cinematic Subtitle System
- * 
- * Generates professional, anime-style subtitles with:
- * - Phrase-by-phrase timing (not full paragraphs)
- * - Word-level synchronization
- * - Cinematic styling (small, bottom-center, shadows)
- * - Smooth fade animations
- * - Proper visual safety (no covering faces/action)
- */
-import * as fs from "fs";
-import * as path from "path";
-import ffmpeg from "../ffmpeg";
-import { downloadFromS3, uploadFileToS3 } from "../s3";
-import type { CinematicScene } from "../types/cinematic";
+/** Captions use provider word boundaries; missing timing is disclosed as scene-level captions. */
+import { writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import ffmpeg,{runFFmpeg} from "../ffmpeg";
+import { downloadAsset } from "../assets";
+import { uploadFileToS3 } from "../s3";
+import { escapeFilterPath,resolveRenderOptions } from "../cinematic/render-options";
+import type { CinematicScene,RenderOptions,TimedWord } from "../types/cinematic";
 
-export interface SubtitlePhrase {
-  text: string;
-  startTime: number;
-  endTime: number;
-  sceneIndex: number;
+export interface SubtitlePhrase {text:string;startTime:number;endTime:number;sceneIndex:number}
+export interface CinematicSubtitleOptions extends RenderOptions {
+  language?:string;words?:TimedWord[];fontSize?:number;fontName?:string;primaryColor?:string;outlineColor?:string;
+  outlineWidth?:number;shadowDepth?:number;marginBottom?:number;fadeInDuration?:number;fadeOutDuration?:number;
+  maxCharsPerLine?:number;maxLines?:number;captionPreset?:"clean"|"bold"|"minimal";
 }
-
-export interface CinematicSubtitleOptions {
-  fontSize?: number; // Default: 18 (much smaller than old 22)
-  fontName?: string; // Default: "Arial"
-  primaryColor?: string; // Default: white
-  outlineColor?: string; // Default: black
-  outlineWidth?: number; // Default: 2
-  shadowDepth?: number; // Default: 1
-  marginBottom?: number; // Default: 50 (safe zone)
-  fadeInDuration?: number; // Default: 0.2s
-  fadeOutDuration?: number; // Default: 0.2s
-  maxCharsPerLine?: number; // Default: 42 (cinematic standard)
-  maxLines?: number; // Default: 2
-}
-
-const DEFAULT_OPTIONS: Required<CinematicSubtitleOptions> = {
-  fontSize: 18,
-  fontName: "Arial",
-  primaryColor: "&HFFFFFF", // White
-  outlineColor: "&H000000", // Black
-  outlineWidth: 2,
-  shadowDepth: 1,
-  marginBottom: 50,
-  fadeInDuration: 0.2,
-  fadeOutDuration: 0.2,
-  maxCharsPerLine: 42,
-  maxLines: 2,
-};
-
-/**
- * Main entry point: Generate and burn cinematic subtitles
- */
-export async function addCinematicSubtitles(
-  jobId: string,
-  scenes: CinematicScene[],
-  timeline: Array<{ start_sec: number; end_sec: number; scene: CinematicScene }>,
-  rawVideoS3Key: string,
-  tmpDir: string,
-  options: CinematicSubtitleOptions = {},
-  onLog?: (msg: string) => void
-): Promise<string> {
-  onLog?.("🎬 Generating cinematic subtitles");
-
-  const opts = { ...DEFAULT_OPTIONS, ...options };
-
-  // Step 1: Split narration into cinematic phrases
-  const phrases = generateSubtitlePhrases(scenes, timeline, opts);
-  onLog?.(`  ✓ Split into ${phrases.length} cinematic phrases`);
-
-  // Step 2: Generate ASS subtitle file (advanced styling)
-  const assContent = generateASSSubtitles(phrases, opts);
-  const assPath = path.join(tmpDir, "cinematic_subs.ass");
-  fs.writeFileSync(assPath, assContent, "utf8");
-
-  // Upload ASS to S3
-  await uploadFileToS3(`jobs/${jobId}/cinematic_subs.ass`, assPath, "text/plain");
-  onLog?.("  ✓ Subtitle file generated");
-
-  // Step 3: Download raw video
-  const rawVideoPath = path.join(tmpDir, "raw_video.mp4");
-  onLog?.("  ⬇️ Downloading video for subtitle burn-in");
-  const rawBuffer = await downloadFromS3(rawVideoS3Key);
-  fs.writeFileSync(rawVideoPath, rawBuffer);
-
-  // Step 4: Burn subtitles with cinematic styling
-  const finalVideoPath = path.join(tmpDir, "final_video.mp4");
-  onLog?.("  🔥 Burning cinematic subtitles into video");
-  await burnCinematicSubtitles(rawVideoPath, assPath, finalVideoPath, opts);
-
-  // Step 5: Upload final video
-  const s3Key = `jobs/${jobId}/final_video.mp4`;
-  await uploadFileToS3(s3Key, finalVideoPath, "video/mp4");
-  onLog?.(`✓ Final cinematic video uploaded: ${s3Key}`);
-
-  return s3Key;
-}
-
-/**
- * Split scene narration into cinematic phrases
- * 
- * Strategy:
- * - Split on natural breaks: periods, commas, semicolons
- * - Keep phrases short (max 42 chars per line, 2 lines max)
- * - Distribute timing evenly across phrases within each scene
- */
-function generateSubtitlePhrases(
-  scenes: CinematicScene[],
-  timeline: Array<{ start_sec: number; end_sec: number; scene: CinematicScene }>,
-  options: Required<CinematicSubtitleOptions>
-): SubtitlePhrase[] {
-  const phrases: SubtitlePhrase[] = [];
-
-  for (let i = 0; i < timeline.length; i++) {
-    const entry = timeline[i];
-    const scene = entry.scene;
-    const sceneDuration = entry.end_sec - entry.start_sec;
-    const narration = scene.narration.trim();
-
-    if (!narration) continue;
-
-    // Split narration into phrases at natural breaks
-    const rawPhrases = splitIntoPhrases(narration, options.maxCharsPerLine * options.maxLines);
-
-    // Distribute timing evenly across phrases
-    const phraseDuration = sceneDuration / rawPhrases.length;
-
-    for (let j = 0; j < rawPhrases.length; j++) {
-      const phraseText = rawPhrases[j].trim();
-      if (!phraseText) continue;
-
-      const startTime = entry.start_sec + j * phraseDuration;
-      const endTime = startTime + phraseDuration;
-
-      phrases.push({
-        text: phraseText,
-        startTime,
-        endTime,
-        sceneIndex: i,
-      });
-    }
-  }
-
-  return phrases;
-}
-
-/**
- * Split text into cinematic phrases at natural breaks
- * 
- * Priority:
- * 1. Sentence boundaries (. ! ?)
- * 2. Clause boundaries (, ; :)
- * 3. Word boundaries (if still too long)
- */
-function splitIntoPhrases(text: string, maxLength: number): string[] {
-  const phrases: string[] = [];
-
-  // First split on sentence boundaries
-  const sentences = text.split(/([.!?]+\s+)/).filter(Boolean);
-
-  let currentPhrase = "";
-
-  for (const part of sentences) {
-    // If it's punctuation, add to current phrase
-    if (/^[.!?]+\s*$/.test(part)) {
-      currentPhrase += part;
+type Timeline=Array<{start_sec:number;end_sec:number;scene:CinematicScene}>;
+export function captionPhrases(timeline:Timeline,options:CinematicSubtitleOptions={}):SubtitlePhrase[]{
+  const phrases:SubtitlePhrase[]=[];
+  const maxChars=(options.maxCharsPerLine??(options.aspectRatio==="9:16"?24:42))*(options.maxLines??2);
+  for(const [sceneIndex,entry] of timeline.entries()){
+    const override=(entry.scene as CinematicScene&{caption?:string}).caption;
+    const words=(options.words??[]).filter(word=>word.sceneIndex===sceneIndex&&Number.isFinite(word.startTime)&&Number.isFinite(word.endTime)&&word.endTime>word.startTime).sort((a,b)=>a.startTime-b.startTime);
+    if(override!==undefined||!words.length){
+      // Never invent word timing. A user-edited caption or missing provider timings is a scene-level cue.
+      const text=(override??entry.scene.narration).trim();
+      if(text)phrases.push({text,startTime:entry.start_sec,endTime:entry.end_sec,sceneIndex});
       continue;
     }
-
-    // If adding this would exceed max length, flush current phrase
-    if (currentPhrase && (currentPhrase + part).length > maxLength) {
-      phrases.push(currentPhrase.trim());
-      currentPhrase = "";
+    let group:TimedWord[]=[];
+    const flush=()=>{if(group.length){const text=group.map(w=>w.text).join(" ");phrases.push({text,startTime:Math.max(entry.start_sec,group[0].startTime),endTime:Math.min(entry.end_sec,group[group.length-1].endTime),sceneIndex});group=[];}};
+    for(const word of words){
+      if(group.length&&(group.map(w=>w.text).join(" ").length+word.text.length+1>maxChars||word.startTime-group[0].startTime>4||word.startTime-group[group.length-1].endTime>0.6))flush();
+      group.push(word);if(/[.!?।]$/.test(word.text))flush();
     }
-
-    // If this part alone is too long, split on commas
-    if (part.length > maxLength) {
-      const clauses = part.split(/([,;:]\s+)/).filter(Boolean);
-
-      for (const clause of clauses) {
-        if (/^[,;:]\s*$/.test(clause)) {
-          currentPhrase += clause;
-          continue;
-        }
-
-        if (currentPhrase && (currentPhrase + clause).length > maxLength) {
-          phrases.push(currentPhrase.trim());
-          currentPhrase = "";
-        }
-
-        // If still too long, split on words
-        if (clause.length > maxLength) {
-          const words = clause.split(/\s+/);
-          for (const word of words) {
-            if (currentPhrase && (currentPhrase + " " + word).length > maxLength) {
-              phrases.push(currentPhrase.trim());
-              currentPhrase = word;
-            } else {
-              currentPhrase += (currentPhrase ? " " : "") + word;
-            }
-          }
-        } else {
-          currentPhrase += (currentPhrase ? " " : "") + clause;
-        }
-      }
-    } else {
-      currentPhrase += (currentPhrase ? " " : "") + part;
-    }
+    flush();
   }
-
-  // Flush remaining
-  if (currentPhrase.trim()) {
-    phrases.push(currentPhrase.trim());
-  }
-
-  return phrases;
+  return phrases.filter(cue=>cue.endTime>cue.startTime);
 }
-
-/**
- * Generate ASS subtitle file with cinematic styling
- * 
- * ASS format provides:
- * - Advanced styling control
- * - Fade animations
- * - Precise positioning
- * - Shadow and outline effects
- */
-function generateASSSubtitles(
-  phrases: SubtitlePhrase[],
-  options: Required<CinematicSubtitleOptions>
-): string {
-  const lines: string[] = [];
-
-  // ASS Header
-  lines.push("[Script Info]");
-  lines.push("Title: Cinematic Subtitles");
-  lines.push("ScriptType: v4.00+");
-  lines.push("WrapStyle: 0");
-  lines.push("PlayResX: 1920");
-  lines.push("PlayResY: 1080");
-  lines.push("");
-
-  // Style Definition
-  lines.push("[V4+ Styles]");
-  lines.push(
-    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
-  );
-
-  // Cinematic style: small, bottom-center, white text, black outline, shadow
-  lines.push(
-    `Style: Cinematic,${options.fontName},${options.fontSize},${options.primaryColor},&H000000FF,${options.outlineColor},&H80000000,1,0,0,0,100,100,0,0,1,${options.outlineWidth},${options.shadowDepth},2,20,20,${options.marginBottom},1`
-  );
-  lines.push("");
-
-  // Events
-  lines.push("[Events]");
-  lines.push("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
-
-  // Add each phrase with fade effects
-  for (const phrase of phrases) {
-    const start = formatASSTime(phrase.startTime);
-    const end = formatASSTime(phrase.endTime);
-
-    // Calculate fade times in milliseconds
-    const fadeInMs = Math.round(options.fadeInDuration * 1000);
-    const fadeOutMs = Math.round(options.fadeOutDuration * 1000);
-
-    // ASS fade effect: \fad(fadeIn, fadeOut)
-    const fadeEffect = `{\\fad(${fadeInMs},${fadeOutMs})}`;
-
-    // Wrap text if needed
-    const wrappedText = wrapText(phrase.text, options.maxCharsPerLine);
-
-    lines.push(
-      `Dialogue: 0,${start},${end},Cinematic,,0,0,0,,${fadeEffect}${wrappedText}`
-    );
-  }
-
-  return lines.join("\n");
+export function subtitleTimestamp(seconds:number,format:"srt"|"vtt"|"ass"="srt"):string{
+  const factor=format==="ass"?100:1000;const units=Math.max(0,Math.round(seconds*factor));
+  const h=Math.floor(units/(3600*factor)),m=Math.floor(units/(60*factor))%60,s=Math.floor(units/factor)%60,sub=units%factor;
+  return `${format==="ass"?h:String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}${format==="srt"?",":"."}${String(sub).padStart(format==="ass"?2:3,"0")}`;
 }
-
-/**
- * Wrap text to max characters per line
- */
-function wrapText(text: string, maxChars: number): string {
-  const words = text.split(/\s+/);
-  const lines: string[] = [];
-  let currentLine = "";
-
-  for (const word of words) {
-    if (currentLine && (currentLine + " " + word).length > maxChars) {
-      lines.push(currentLine);
-      currentLine = word;
-    } else {
-      currentLine += (currentLine ? " " : "") + word;
-    }
-  }
-
-  if (currentLine) {
-    lines.push(currentLine);
-  }
-
-  // Join with ASS line break: \N
-  return lines.join("\\N");
+const safeText=(text:string)=>text.replace(/\r/g,"").replace(/-->/g,"→");
+export function exportSrt(phrases:SubtitlePhrase[]):string{
+  return phrases.map((p,index)=>`${index+1}\n${subtitleTimestamp(p.startTime)} --> ${subtitleTimestamp(p.endTime)}\n${safeText(p.text)}\n`).join("\n");
 }
-
-/**
- * Format seconds as ASS timestamp: H:MM:SS.CC
- */
-function formatASSTime(totalSeconds: number): string {
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = Math.floor(totalSeconds % 60);
-  const centiseconds = Math.round((totalSeconds % 1) * 100);
-
-  return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(centiseconds).padStart(2, "0")}`;
+export function exportVtt(phrases:SubtitlePhrase[]):string{
+  return "WEBVTT\n\n"+phrases.map(p=>`${subtitleTimestamp(p.startTime,"vtt")} --> ${subtitleTimestamp(p.endTime,"vtt")}\n${safeText(p.text).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}\n`).join("\n");
 }
-
-/**
- * Burn ASS subtitles into video with FFmpeg
- */
-function burnCinematicSubtitles(
-  videoPath: string,
-  assPath: string,
-  outputPath: string,
-  options: Required<CinematicSubtitleOptions>
-): Promise<void> {
-  // Escape path for FFmpeg filter (Windows backslashes need special handling)
-  const escapedAss = assPath.replace(/\\/g, "/").replace(/:/g, "\\:");
-
-  return new Promise((resolve, reject) => {
-    console.log(`[Cinematic Subtitles] Burning subtitles: ${assPath}`);
-
-    ffmpeg(videoPath)
-      .videoFilters(`ass='${escapedAss}'`)
-      .outputOptions([
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",             // was: fast — saves additional RAM
-        "-crf",
-        "22",
-        "-c:a",
-        "copy",
-        "-pix_fmt",
-        "yuv420p",
-        "-threads",
-        "2",                    // limit CPU/RAM usage
-        "-max_muxing_queue_size",
-        "512",
-      ])
-      .output(outputPath)
-      .on("start", (cmd) => {
-        console.log(`[Cinematic Subtitles] FFmpeg command: ${cmd}`);
-      })
-      .on("progress", (progress) => {
-        if (progress.percent) {
-          console.log(
-            `[Cinematic Subtitles] Progress: ${progress.percent.toFixed(1)}%`
-          );
-        }
-      })
-      .on("end", () => {
-        console.log(`[Cinematic Subtitles] Complete: ${outputPath}`);
-        resolve();
-      })
-      .on("error", (err, stdout, stderr) => {
-        console.error(`[Cinematic Subtitles] Error: ${err.message}`);
-        console.error(`[Cinematic Subtitles] FFmpeg stderr:\n${stderr}`);
-        reject(err);
-      })
-      .run();
-  });
+export function wrapCaption(text:string,width:number):string{
+  const lines:string[]=[];let current="";
+  for(const word of text.replace(/[{}]/g,"").replace(/\\/g,"／").split(/\s+/)){
+    if(current&&(current+" "+word).length>width){lines.push(current);current=word;}else current+=(current?" ":"")+word;
+  }
+  if(current)lines.push(current);return lines.join("\\N");
+}
+export function generateASSSubtitles(phrases:SubtitlePhrase[],options:CinematicSubtitleOptions={}):string{
+  const {width,height}=resolveRenderOptions(options);const vertical=options.aspectRatio==="9:16";
+  const hindi=["hindi","hi"].includes(options.language??"");
+  const font=(options.fontName??(hindi?(process.platform==="win32"?"Nirmala UI":"Noto Sans Devanagari"):"Arial")).replace(/[,\r\n]/g,"");
+  const fontSize=options.fontSize??Math.round(width*(vertical?0.048:0.026)*(options.captionPreset==="bold"?1.15:1));
+  const margin=options.marginBottom??Math.round(height*(vertical?0.16:0.07));
+  const color=(value:string|undefined,fallback:string)=>value&&/^&H[0-9a-f]{6,8}$/i.test(value)?value:fallback;
+  return ["[Script Info]","ScriptType: v4.00+",`PlayResX: ${width}`,`PlayResY: ${height}`,"WrapStyle: 0","ScaledBorderAndShadow: yes","","[V4+ Styles]",
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    `Style: Caption,${font},${fontSize},${color(options.primaryColor,"&H00FFFFFF")},&H00FFFFFF,${color(options.outlineColor,"&H00000000")},&H80000000,${options.captionPreset==="bold"?-1:0},0,0,0,100,100,0,0,1,${options.outlineWidth??2},${options.shadowDepth??1},2,${Math.round(width*0.06)},${Math.round(width*0.06)},${margin},1`,
+    "","[Events]","Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ...phrases.map(p=>`Dialogue: 0,${subtitleTimestamp(p.startTime,"ass")},${subtitleTimestamp(p.endTime,"ass")},Caption,,0,0,0,,{\\fad(${Math.round((options.fadeInDuration??0.08)*1000)},${Math.round((options.fadeOutDuration??0.08)*1000)})}${wrapCaption(p.text,options.maxCharsPerLine??(vertical?24:42))}`),""].join("\n");
+}
+export async function burnCinematicSubtitles(videoPath:string,assPath:string,outputPath:string,options:CinematicSubtitleOptions={}):Promise<void>{
+  const fonts=process.env.SUBTITLE_FONT_DIR?`:fontsdir='${escapeFilterPath(process.env.SUBTITLE_FONT_DIR)}'`:"";
+  const command=ffmpeg(videoPath).videoFilters(`ass='${escapeFilterPath(assPath)}'${fonts}`).outputOptions(["-c:v","libx264","-preset","veryfast","-crf","20","-c:a","copy","-pix_fmt","yuv420p","-threads","2","-movflags","+faststart"]).output(outputPath);
+  await runFFmpeg(command,30*60_000,options.signal);
+}
+export async function addCinematicSubtitles(jobId:string,_scenes:CinematicScene[],timeline:Timeline,rawVideoS3Key:string,tmpDir:string,options:CinematicSubtitleOptions={},onLog?:(message:string)=>void):Promise<string>{
+  const phrases=captionPhrases(timeline,options);if(!phrases.length)throw new Error("No valid captions could be created");
+  if(timeline.some((_,index)=>!(options.words??[]).some(word=>word.sceneIndex===index)))onLog?.("Some scenes lack provider word timings; those captions use disclosed scene-level cues.");
+  const assPath=join(tmpDir,"cinematic_subs.ass"),srtPath=join(tmpDir,"captions.srt"),vttPath=join(tmpDir,"captions.vtt");
+  await Promise.all([writeFile(assPath,generateASSSubtitles(phrases,options),"utf8"),writeFile(srtPath,exportSrt(phrases),"utf8"),writeFile(vttPath,exportVtt(phrases),"utf8")]);
+  await Promise.all([[assPath,"cinematic_subs.ass","text/plain"],[srtPath,"captions.srt","application/x-subrip"],[vttPath,"captions.vtt","text/vtt"]].map(([file,name,type])=>uploadFileToS3(`jobs/${jobId}/${name}`,file,type)));
+  const rawPath=join(tmpDir,"raw_video.mp4");if(!existsSync(rawPath))await downloadAsset({provider:"s3",key:rawVideoS3Key},rawPath);
+  const finalPath=join(tmpDir,"final_video.mp4");await burnCinematicSubtitles(rawPath,assPath,finalPath,options);
+  const key=`jobs/${jobId}/final_video.mp4`;await uploadFileToS3(key,finalPath,"video/mp4");onLog?.("Captions rendered and SRT/VTT exports saved");return key;
 }

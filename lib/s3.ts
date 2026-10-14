@@ -1,86 +1,83 @@
-/**
- * AWS S3 helpers — upload, download, presigned URLs.
- * All intermediate assets use a 7-day lifecycle; final MP4s are permanent.
- */
-import {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-  DeleteObjectCommand,
-} from "@aws-sdk/client-s3";
+/** Private S3 objects. Persist keys; issue signed URLs only after authorization. */
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand, ListObjectVersionsCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { Readable } from "stream";
+import { Readable } from "node:stream";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
 
-const s3 = new S3Client({
-  region: (process.env.AWS_REGION ?? "us-east-1").trim(),
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID!.trim(),
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!.trim(),
-  },
-});
-
-const BUCKET = (process.env.AWS_S3_BUCKET ?? "").trim();
-
-/** Upload a Buffer or Readable stream to S3. Returns the S3 key. */
-export async function uploadToS3(
-  key: string,
-  body: Buffer | Readable | string,
-  contentType: string
-): Promise<string> {
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: BUCKET,
-      Key: key,
-      Body: body,
-      ContentType: contentType,
-    })
-  );
+let client: S3Client | undefined;
+export function getS3Client(): S3Client {
+  if (!client) {
+    const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
+    const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
+    client = new S3Client({ region: process.env.AWS_REGION?.trim() || "us-east-1",
+      ...(process.env.S3_ENDPOINT_URL?{endpoint:process.env.S3_ENDPOINT_URL,forcePathStyle:true}:{}),
+      ...(accessKeyId && secretAccessKey ? { credentials: { accessKeyId, secretAccessKey } } : {}) });
+  }
+  return client;
+}
+export function getS3Bucket(): string {
+  const bucket = process.env.AWS_S3_BUCKET?.trim();
+  if (!bucket) throw new Error("AWS_S3_BUCKET is not configured");
+  return bucket;
+}
+export async function uploadToS3(key: string, body: Buffer | Readable | string, contentType: string): Promise<string> {
+  await getS3Client().send(new PutObjectCommand({ Bucket: getS3Bucket(), Key: key, Body: body,
+    ContentType: contentType, CacheControl: "private, max-age=0" }));
   return key;
 }
-
-/** Upload a local file path to S3 using a read stream. */
-export async function uploadFileToS3(
-  key: string,
-  filePath: string,
-  contentType: string
-): Promise<string> {
-  const fs = await import("fs");
-  const stream = fs.createReadStream(filePath);
-  return uploadToS3(key, stream, contentType);
+export async function uploadFileToS3(key: string, filePath: string, contentType: string): Promise<string> {
+  const info = await stat(filePath);
+  const stream = createReadStream(filePath);
+  try {
+    await getS3Client().send(new PutObjectCommand({ Bucket: getS3Bucket(), Key: key, Body: stream,
+      ContentLength: info.size, ContentType: contentType, CacheControl: "private, max-age=0" }));
+    return key;
+  } finally { stream.destroy(); }
 }
-
-/** Download an S3 object and return it as a Buffer. */
+export async function openS3Stream(key: string): Promise<Readable> {
+  const response = await getS3Client().send(new GetObjectCommand({ Bucket: getS3Bucket(), Key: key }));
+  if (!response.Body) throw new Error("Storage object has no content");
+  return response.Body as Readable;
+}
 export async function downloadFromS3(key: string): Promise<Buffer> {
-  const response = await s3.send(
-    new GetObjectCommand({ Bucket: BUCKET, Key: key })
-  );
-  const stream = response.Body as Readable;
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    stream.on("data", (chunk: Buffer) => chunks.push(chunk));
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", reject);
-  });
+  const stream = await openS3Stream(key);
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks);
 }
-
-/** Generate a presigned GET URL (default 1 hour expiry). */
-export async function getPresignedUrl(
-  key: string,
-  expiresIn = 3600
-): Promise<string> {
-  return getSignedUrl(
-    s3,
-    new GetObjectCommand({ Bucket: BUCKET, Key: key }),
-    { expiresIn }
-  );
+export async function verifyS3Object(key: string): Promise<boolean> {
+  try {
+    const response = await getS3Client().send(new HeadObjectCommand({ Bucket: getS3Bucket(), Key: key }));
+    return (response.ContentLength ?? 0) > 0;
+  } catch (error) {
+    const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+    if (status === 404 || (error instanceof Error && error.name === "NotFound")) return false;
+    throw error;
+  }
 }
-
-/** Delete an object from S3. */
+export async function getPresignedUrl(key: string, expiresIn = 300, downloadFilename?: string): Promise<string> {
+  return getSignedUrl(getS3Client(), new GetObjectCommand({ Bucket: getS3Bucket(), Key: key,
+    ...(downloadFilename ? { ResponseContentDisposition: `attachment; filename="${downloadFilename.replace(/["\r\n\\]/g, "_")}"` } : {}) }),
+    { expiresIn: Math.min(Math.max(expiresIn, 1), 3600) });
+}
 export async function deleteFromS3(key: string): Promise<void> {
-  await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+  await getS3Client().send(new DeleteObjectCommand({ Bucket: getS3Bucket(), Key: key }));
 }
-
-/** Build the public S3 URL for a key (only works for public buckets). */
+/** Delete all versions and delete markers, so versioning does not keep billed video copies. */
+export async function deleteS3Permanently(key:string):Promise<void>{
+  let keyMarker:string|undefined,versionMarker:string|undefined;
+  const versions:{Key:string;VersionId?:string}[]=[];
+  do{
+    const page=await getS3Client().send(new ListObjectVersionsCommand({Bucket:getS3Bucket(),Prefix:key,KeyMarker:keyMarker,VersionIdMarker:versionMarker}));
+    for(const item of [...page.Versions??[],...page.DeleteMarkers??[]]) if(item.Key===key) versions.push({Key:key,VersionId:item.VersionId});
+    keyMarker=page.IsTruncated?page.NextKeyMarker:undefined;versionMarker=page.NextVersionIdMarker;
+    if(page.IsTruncated&&!keyMarker)throw new Error("Storage version listing was incomplete");
+  }while(keyMarker);
+  if(!versions.length){await deleteFromS3(key);return;}
+  for(const version of versions)await getS3Client().send(new DeleteObjectCommand({Bucket:getS3Bucket(),...version}));
+}
+/** Legacy public URL parser support only; new access must use signed URLs. */
 export function s3Url(key: string): string {
-  return `https://${BUCKET}.s3.${(process.env.AWS_REGION ?? "us-east-1").trim()}.amazonaws.com/${key}`;
+  return `https://${getS3Bucket()}.s3.${process.env.AWS_REGION?.trim() || "us-east-1"}.amazonaws.com/${key}`;
 }
